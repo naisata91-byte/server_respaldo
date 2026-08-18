@@ -1,0 +1,27 @@
+{
+  "name": "naisata-crm",
+  "version": "1.0.0",
+  "description": "Servidor CRM Naisata - WhatsApp Bot y gestión de proyectos",
+  "main": "server_2.js",
+  "scripts": {
+    "start": "node server_2.js",
+    "dev": "nodemon server_2.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "http-proxy-middleware": "^4.2.0",
+    "imap": "^0.8.19",
+    "mailparser": "^3.9.15",
+    "mongoose": "^8.0.0",
+    "multer": "^1.4.5-lts.1",
+    "nodemailer": "^6.10.1",
+    "qrcode": "^1.5.3",
+    "socket.io": "^4.8.3",
+    "whatsapp-web.js": "^1.23.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
