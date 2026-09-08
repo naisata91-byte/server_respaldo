@@ -283,7 +283,7 @@ const CRMCotizacionSchema = new mongoose.Schema({
     creadorTelefono: String,
     estado: { 
         type: String, 
-        enum: ['Neutral', 'Levantamiento', 'Cotizando', 'En Seguimiento', 'Aprobado', 'Perdido', 'Perdida', 'Terminada', 'Cerrada', 'En Proceso', 'Ganada'], 
+        enum: ['Neutral', 'Levantamiento', 'Cotizando', 'En Seguimiento', 'Aprobado', 'Perdido', 'Perdida', 'Terminada', 'Cerrada', 'En Proceso', 'Ganada', 'Cancelada'], 
         default: 'Neutral' 
     },
     partidas: [{
