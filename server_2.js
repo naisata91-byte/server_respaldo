@@ -380,6 +380,7 @@ const CRMActividadSchema = new mongoose.Schema({
     herramientasAsignadas: Array,
     tipoDestino: String,
     proyectoId: String,
+    cotizacionId: String,
     estado: { type: String, enum: ['Pendiente', 'En Camino', 'En Sitio', 'En Progreso', 'Completada'], default: 'Pendiente' },
     fechaVencimiento: Date,
     horaInicio: String,  // "09:00" formato HH:MM
@@ -951,6 +952,16 @@ app.get('/api/cotizaciones', async (req, res) => {
     } catch(err) { res.status(500).json({error: err.message}); }
 });
 
+app.get('/api/cotizaciones/activas', async (req, res) => {
+    try {
+        const cots = await CRMCotizacion.find(
+            { estado: { $nin: ['Perdido', 'Perdida', 'Rechazado', 'Cerrada', 'Terminada'] } },
+            'folio descripcion clienteNombre estado'
+        ).sort({ fechaCreacion: -1 });
+        res.json(cots);
+    } catch(err) { res.status(500).json({error: err.message}); }
+});
+
 // Asignar folios a TODAS las cotizaciones que no lo tengan (debe ir ANTES de /:id)
 app.post('/api/cotizaciones/asignar-folios-todos', async (req, res) => {
     try {
@@ -1059,6 +1070,37 @@ app.put('/api/cotizaciones/:id', async (req, res) => {
         try { if (global.io) global.io.emit('cotizacion_actualizada', updatedCot); } catch(_) {}
         res.json({ message: 'Cotización actualizada con éxito', data: updatedCot });
     } catch(err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Cancelar venta de una cotización (Ganada -> Cancelada) y eliminar su Panel Operativo
+app.post('/api/cotizaciones/:id/cancelar-venta', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const cot = await CRMCotizacion.findById(id);
+        if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
+
+        const proyectoActivoId = cot.proyectoActivoId;
+
+        // Cambiar estado y limpiar proyecto
+        cot.estado = 'Cancelada';
+        cot.proyectoActivoId = null;
+        await cot.save();
+
+        // Eliminar el Panel Operativo vinculado
+        if (proyectoActivoId) {
+            const proyectoEliminado = await CRMProyecto.findOneAndDelete({ folio: proyectoActivoId });
+            if (proyectoEliminado) {
+                // Eliminar también las tareas asociadas al proyecto
+                await CRMActividad.deleteMany({ proyectoId: proyectoEliminado._id });
+                await CRMActividad.deleteMany({ cotizacionId: proyectoActivoId });
+            }
+        }
+
+        res.json({ message: 'Venta cancelada exitosamente.', cotizacion: cot });
+    } catch (err) {
+        waLog.addError('Error al cancelar venta', err);
         res.status(500).json({ error: err.message });
     }
 });
