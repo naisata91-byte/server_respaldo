@@ -733,12 +733,36 @@ app.get('/api/usuarios', async (req, res) => {
     } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
+// En la colección histórica de usuarios conviven _id String y ObjectId. No
+// dejamos que el schema de Mongoose convierta silenciosamente uno en otro,
+// porque eso puede leer o actualizar una cuenta sombra con el mismo texto.
+function tipoIdUsuario(id) {
+    return id?._bsontype === 'ObjectId' || id instanceof mongoose.Types.ObjectId ? 'objectId' : 'string';
+}
+function selectorUsuario(id, idType = '') {
+    const value = String(id || '').trim();
+    const type = String(idType || '').toLowerCase();
+    if (!value) return null;
+    if (type === 'objectid') return mongoose.isValidObjectId(value) ? { _id: new mongoose.Types.ObjectId(value) } : null;
+    if (type === 'string') return { _id: value };
+    return null;
+}
+async function buscarUsuarioRaw(id, idType = '') {
+    const users = mongoose.connection.db.collection('users');
+    const exact = selectorUsuario(id, idType);
+    if (exact) return users.findOne(exact);
+    const value = String(id || '').trim();
+    let user = await users.findOne({ _id: value });
+    if (!user && mongoose.isValidObjectId(value)) user = await users.findOne({ _id: new mongoose.Types.ObjectId(value) });
+    return user;
+}
+
 // Obtener perfil de usuario por ID (incluye `categoria`)
 app.get('/api/users/:id', async (req, res) => {
     try {
-        const user = await UserRef.findById(req.params.id).select('-password -tokenPortal');
+        const user = await buscarUsuarioRaw(req.params.id, req.query.idType);
         if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
-        res.json(user);
+        res.json(empleadoPublico(user));
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -747,12 +771,10 @@ app.put('/api/users/:id/categoria', async (req, res) => {
     try {
         const { categoria } = req.body;
         if (!categoria) return res.status(400).json({ error: 'Falta el campo categoria' });
-        const updated = await UserRef.findOneAndUpdate(
-            { _id: req.params.id },
-            { $set: { categoria } },
-            { new: true, upsert: true, setDefaultsOnInsert: true }
-        );
-        res.json(updated);
+        const user = await buscarUsuarioRaw(req.params.id, req.query.idType);
+        if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+        await mongoose.connection.db.collection('users').updateOne({ _id: user._id }, { $set: { categoria } });
+        res.json(empleadoPublico({ ...user, categoria }));
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2874,6 +2896,7 @@ function empleadoPublico(empleado) {
     const data = empleado && typeof empleado.toObject === 'function' ? empleado.toObject() : { ...(empleado || {}) };
     delete data.password;
     delete data.tokenPortal;
+    data.idTipo = tipoIdUsuario(data._id);
     return data;
 }
 
@@ -2919,7 +2942,7 @@ app.post('/api/login', async (req, res) => {
         }
 
         const searchCorreo = String(correo).trim().toLowerCase();
-        const empleado = await UserRef.findOne({ correo: searchCorreo });
+        const empleado = await mongoose.connection.db.collection('users').findOne({ correo: searchCorreo });
 
         if (!empleado) {
             return res.status(401).json({ error: 'Credenciales inválidas.' });
@@ -2934,8 +2957,9 @@ app.post('/api/login', async (req, res) => {
         }
 
         if (!String(empleado.password || '').startsWith('scrypt$') && !/^\$2[aby]\$\d+\$/.test(String(empleado.password || ''))) {
-            empleado.password = protegerPasswordEmpleado(password);
-            await empleado.save();
+            const passwordProtegida = protegerPasswordEmpleado(password);
+            await mongoose.connection.db.collection('users').updateOne({ _id: empleado._id }, { $set: { password: passwordProtegida } });
+            empleado.password = passwordProtegida;
         }
 
         // Devolvemos el empleado completo en el objeto "user" como espera el frontend
