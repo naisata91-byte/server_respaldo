@@ -175,15 +175,68 @@ const io = new Server(server, {
 });
 global.io = io; // Expose io globally to routes
 
+// Bloqueos efímeros de edición por renglón. No se guardan en MongoDB: se
+// liberan al salir del campo o al desconectarse el navegador.
+const bloqueosCotizacion = new Map();
+const claveBloqueoCotizacion = (cotizacionId, coleccion, lineaId) => `${cotizacionId}:${coleccion}:${lineaId}`;
+function leerBloqueoCotizacion(cotizacionId, coleccion, lineaId) {
+    const key = claveBloqueoCotizacion(cotizacionId, coleccion, lineaId);
+    const bloqueo = bloqueosCotizacion.get(key);
+    if (bloqueo && Date.now() - bloqueo.actualizadoEn > 5 * 60 * 1000) {
+        bloqueosCotizacion.delete(key);
+        return null;
+    }
+    return bloqueo || null;
+}
+function liberarBloqueosSocket(socketId, soloCotizacionId = '') {
+    for (const [key, bloqueo] of bloqueosCotizacion.entries()) {
+        if (bloqueo.socketId !== socketId || (soloCotizacionId && bloqueo.cotizacionId !== soloCotizacionId)) continue;
+        bloqueosCotizacion.delete(key);
+        try { global.io?.to(`cotizacion:${bloqueo.cotizacionId}`).emit('cotizacion_bloqueo_linea', { ...bloqueo, activo: false }); } catch (_) {}
+    }
+}
+
 io.on('connection', socket => {
     socket.on('cotizacion:unirse', data => {
         const cotizacionId = String(data?.cotizacionId || '').trim();
-        if (cotizacionId) socket.join(`cotizacion:${cotizacionId}`);
+        if (cotizacionId) {
+            socket.data.cotizacionClientId = String(data?.clientId || '');
+            socket.data.cotizacionActor = String(data?.actor || 'Alguien');
+            socket.join(`cotizacion:${cotizacionId}`);
+        }
     });
     socket.on('cotizacion:salir', data => {
         const cotizacionId = String(data?.cotizacionId || '').trim();
-        if (cotizacionId) socket.leave(`cotizacion:${cotizacionId}`);
+        if (cotizacionId) {
+            liberarBloqueosSocket(socket.id, cotizacionId);
+            socket.leave(`cotizacion:${cotizacionId}`);
+        }
     });
+    socket.on('cotizacion:bloquear-linea', data => {
+        const cotizacionId = String(data?.cotizacionId || '').trim();
+        const coleccion = String(data?.coleccion || '').trim();
+        const lineaId = String(data?.lineaId || '').trim();
+        if (!cotizacionId || !['partidas', 'productosSugeridos'].includes(coleccion) || !lineaId) return;
+        const actual = leerBloqueoCotizacion(cotizacionId, coleccion, lineaId);
+        if (actual && actual.socketId !== socket.id) {
+            socket.emit('cotizacion_linea_ocupada', { cotizacionId, coleccion, lineaId, usuario: actual.usuario || 'Alguien' });
+            return;
+        }
+        const bloqueo = { cotizacionId, coleccion, lineaId, socketId: socket.id, clientId: socket.data.cotizacionClientId || '', usuario: socket.data.cotizacionActor || 'Alguien', actualizadoEn: Date.now() };
+        bloqueosCotizacion.set(claveBloqueoCotizacion(cotizacionId, coleccion, lineaId), bloqueo);
+        io.to(`cotizacion:${cotizacionId}`).emit('cotizacion_bloqueo_linea', { ...bloqueo, activo: true });
+    });
+    socket.on('cotizacion:liberar-linea', data => {
+        const cotizacionId = String(data?.cotizacionId || '').trim();
+        const coleccion = String(data?.coleccion || '').trim();
+        const lineaId = String(data?.lineaId || '').trim();
+        const key = claveBloqueoCotizacion(cotizacionId, coleccion, lineaId);
+        const actual = bloqueosCotizacion.get(key);
+        if (actual?.socketId !== socket.id) return;
+        bloqueosCotizacion.delete(key);
+        io.to(`cotizacion:${cotizacionId}`).emit('cotizacion_bloqueo_linea', { ...actual, activo: false });
+    });
+    socket.on('disconnect', () => liberarBloqueosSocket(socket.id));
 });
 
 // Middleware
@@ -394,6 +447,11 @@ function payloadLinea(tipo, input, actor, existing = {}) {
 }
 function emitirColaboracion(cotizacionId, evento) {
     try { if (global.io) global.io.to(`cotizacion:${cotizacionId}`).emit('cotizacion_colaboracion', evento); } catch (_) {}
+}
+function lineaBloqueadaPorOtraSesion(req, cotizacionId, coleccion, lineaId) {
+    const bloqueo = leerBloqueoCotizacion(String(cotizacionId), coleccion, String(lineaId));
+    const clientId = clientCotizacion(req);
+    return bloqueo && bloqueo.clientId && bloqueo.clientId !== clientId ? bloqueo : null;
 }
 
 const CRMProyectoSchema = new mongoose.Schema({
@@ -1196,6 +1254,8 @@ function crearRutasLineasCotizacion(tipo, campo) {
 
     app.patch(`/api/cotizaciones/:id/${tipo}/:lineaId`, async (req, res) => {
         try {
+            const bloqueo = lineaBloqueadaPorOtraSesion(req, req.params.id, campo, req.params.lineaId);
+            if (bloqueo) return res.status(423).json({ error: `${bloqueo.usuario || 'Alguien'} está editando esta partida.`, bloqueada: true, usuario: bloqueo.usuario });
             const cot = await CRMCotizacion.findById(req.params.id);
             if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
             normalizarLineasCotizacion(cot);
@@ -1220,6 +1280,8 @@ function crearRutasLineasCotizacion(tipo, campo) {
 
     app.delete(`/api/cotizaciones/:id/${tipo}/:lineaId`, async (req, res) => {
         try {
+            const bloqueo = lineaBloqueadaPorOtraSesion(req, req.params.id, campo, req.params.lineaId);
+            if (bloqueo) return res.status(423).json({ error: `${bloqueo.usuario || 'Alguien'} está editando esta partida.`, bloqueada: true, usuario: bloqueo.usuario });
             const cot = await CRMCotizacion.findById(req.params.id);
             if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
             normalizarLineasCotizacion(cot);
