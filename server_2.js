@@ -669,7 +669,7 @@ async function documentoPorNombre(collection, nombreNormalizado) {
     let document = await collection.findOne({ nombreNormalizado });
     if (document) return document;
     // Los documentos anteriores no tenían `nombreNormalizado`.
-    const candidates = await collection.find({ nombre: { $exists: true } }, { projection: { nombre: 1, nombreNormalizado: 1, ubicacion: 1, empresaId: 1, companyId: 1, logo: 1, createdAt: 1, updatedAt: 1 } }).toArray();
+    const candidates = await collection.find({ nombre: { $exists: true } }, { projection: { nombre: 1, nombreNormalizado: 1, ubicacion: 1, contacto: 1, telefonoContacto: 1, correoContacto: 1, empresaId: 1, companyId: 1, logo: 1, createdAt: 1, updatedAt: 1 } }).toArray();
     document = candidates.find(item => textoNormalizado(item.nombre) === nombreNormalizado) || null;
     if (document && !document.nombreNormalizado) {
         await collection.updateOne({ _id: document._id }, { $set: { nombreNormalizado } });
@@ -715,6 +715,9 @@ async function asegurarClienteCotizacion(data) {
         // El lugar de ejecución es la mejor ubicación inicial disponible; se
         // puede corregir después desde Entregables.
         ubicacion: textoVisible(data.lugarEjecucion),
+        contacto: textoVisible(data.contacto),
+        telefonoContacto: '',
+        correoContacto: '',
         empresaId: '',
         companyId: '',
         logo: null,
@@ -834,7 +837,11 @@ app.post('/api/sites', upload.single('logo'), async (req, res) => {
         const now = new Date();
         const site = {
             _id: new mongoose.Types.ObjectId(), nombre, nombreNormalizado: normalizado,
-            ubicacion: textoVisible(req.body?.ubicacion), empresaId, companyId: empresaId,
+            ubicacion: textoVisible(req.body?.ubicacion),
+            contacto: textoVisible(req.body?.contacto),
+            telefonoContacto: textoVisible(req.body?.telefonoContacto),
+            correoContacto: textoVisible(req.body?.correoContacto),
+            empresaId, companyId: empresaId,
             logo: req.file ? `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}` : null,
             origen: 'manual', createdAt: now, updatedAt: now,
         };
@@ -863,6 +870,9 @@ app.put('/api/sites/:id', upload.single('logo'), async (req, res) => {
             patch.nombre = nombre; patch.nombreNormalizado = normalizado;
         }
         if (req.body?.ubicacion !== undefined) patch.ubicacion = textoVisible(req.body.ubicacion);
+        if (req.body?.contacto !== undefined) patch.contacto = textoVisible(req.body.contacto);
+        if (req.body?.telefonoContacto !== undefined) patch.telefonoContacto = textoVisible(req.body.telefonoContacto);
+        if (req.body?.correoContacto !== undefined) patch.correoContacto = textoVisible(req.body.correoContacto);
         if (req.body?.empresaId !== undefined || req.body?.companyId !== undefined) {
             const empresaId = String(req.body?.empresaId ?? req.body?.companyId ?? '').trim();
             patch.empresaId = empresaId; patch.companyId = empresaId;
