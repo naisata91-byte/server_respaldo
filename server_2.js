@@ -625,15 +625,197 @@ const PriceListSchema = new mongoose.Schema({
 
 
 // ============================================================================
-// ENDPOINTS DE CLIENTES (SITES)
+// EMPRESAS Y CLIENTES (SITES)
+//
+// `companies` es la empresa matriz y `sites` el cliente/sede operativa. La
+// aplicación histórica guardó el vínculo como `companyId`; el CRM actual usa
+// `empresaId`. Conservamos ambos al leer/escribir para no romper expedientes,
+// listas de precios ni entregables ya creados.
 // ============================================================================
+const coleccionCRM = (name) => mongoose.connection.collection(name);
+const textoVisible = (value) => String(value || '').trim().replace(/\s+/g, ' ');
+const textoNormalizado = (value) => textoVisible(value).toLocaleLowerCase('es-MX')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+async function documentoPorId(collection, id) {
+    const value = String(id || '').trim();
+    if (!value) return null;
+    let document = await collection.findOne({ _id: value });
+    if (!document && mongoose.isValidObjectId(value)) {
+        document = await collection.findOne({ _id: new mongoose.Types.ObjectId(value) });
+    }
+    if (!document) document = await collection.findOne({ id: value });
+    return document;
+}
+
+function documentoPublicoCRM(document) {
+    if (!document) return null;
+    const value = { ...document, id: String(document.id || document._id) };
+    delete value._id;
+    return value;
+}
+
+function clientePublico(document) {
+    const value = documentoPublicoCRM(document);
+    if (!value) return null;
+    // Respuesta compatible para learn.html/app.js (companyId) y CRM (empresaId).
+    value.empresaId = String(value.empresaId || value.companyId || '');
+    value.companyId = value.empresaId;
+    return value;
+}
+
+async function documentoPorNombre(collection, nombreNormalizado) {
+    if (!nombreNormalizado) return null;
+    let document = await collection.findOne({ nombreNormalizado });
+    if (document) return document;
+    // Los documentos anteriores no tenían `nombreNormalizado`.
+    const candidates = await collection.find({ nombre: { $exists: true } }, { projection: { nombre: 1, nombreNormalizado: 1, ubicacion: 1, empresaId: 1, companyId: 1, logo: 1, createdAt: 1, updatedAt: 1 } }).toArray();
+    document = candidates.find(item => textoNormalizado(item.nombre) === nombreNormalizado) || null;
+    if (document && !document.nombreNormalizado) {
+        await collection.updateOne({ _id: document._id }, { $set: { nombreNormalizado } });
+        document.nombreNormalizado = nombreNormalizado;
+    }
+    return document;
+}
+
+function emitirCliente(evento, cliente) {
+    try { if (global.io) global.io.emit(evento, cliente); } catch (_) {}
+}
+
+async function asegurarClienteCotizacion(data) {
+    const sites = coleccionCRM('sites');
+    const nombreEscrito = textoVisible(data.clienteNombre);
+    if (data.clienteId) {
+        const existente = await documentoPorId(sites, data.clienteId);
+        if (existente) {
+            const cliente = clientePublico(existente);
+            data.clienteId = cliente.id;
+            data.clienteNombre = cliente.nombre || nombreEscrito;
+            return { cliente, creado: false };
+        }
+        // No dejamos una referencia inválida si el cliente fue eliminado.
+        data.clienteId = '';
+    }
+    const normalizado = textoNormalizado(nombreEscrito);
+    if (!normalizado) return { cliente: null, creado: false };
+
+    const encontrado = await documentoPorNombre(sites, normalizado);
+    if (encontrado) {
+        const cliente = clientePublico(encontrado);
+        data.clienteId = cliente.id;
+        data.clienteNombre = cliente.nombre || nombreEscrito;
+        return { cliente, creado: false };
+    }
+
+    const now = new Date();
+    const nuevo = {
+        _id: new mongoose.Types.ObjectId(),
+        nombre: nombreEscrito,
+        nombreNormalizado: normalizado,
+        // El lugar de ejecución es la mejor ubicación inicial disponible; se
+        // puede corregir después desde Entregables.
+        ubicacion: textoVisible(data.lugarEjecucion),
+        empresaId: '',
+        companyId: '',
+        logo: null,
+        origen: 'cotizacion',
+        createdAt: now,
+        updatedAt: now,
+    };
+    await sites.insertOne(nuevo);
+    const cliente = clientePublico(nuevo);
+    data.clienteId = cliente.id;
+    data.clienteNombre = cliente.nombre;
+    emitirCliente('site_updated', cliente);
+    return { cliente, creado: true };
+}
+
+// ---------------------------------------------------------------------------
+// Empresas matriz
+// ---------------------------------------------------------------------------
+app.get('/api/companies', async (req, res) => {
+    try {
+        const companies = await coleccionCRM('companies').find({}).sort({ nombre: 1 }).toArray();
+        res.json(companies.map(documentoPublicoCRM));
+    } catch (error) {
+        console.error('Error fetching companies:', error);
+        res.status(500).json({ error: 'No se pudieron obtener las empresas.' });
+    }
+});
+
+app.post('/api/companies', upload.single('logo'), async (req, res) => {
+    try {
+        const nombre = textoVisible(req.body?.nombre);
+        if (!nombre) return res.status(400).json({ error: 'El nombre de la empresa es obligatorio.' });
+        const normalizado = textoNormalizado(nombre);
+        const companies = coleccionCRM('companies');
+        const existente = await documentoPorNombre(companies, normalizado);
+        if (existente) return res.status(409).json({ error: 'Ya existe una empresa con ese nombre.', data: documentoPublicoCRM(existente) });
+        const now = new Date();
+        const company = {
+            _id: new mongoose.Types.ObjectId(), nombre, nombreNormalizado: normalizado,
+            logo: req.file ? `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}` : null,
+            createdAt: now, updatedAt: now,
+        };
+        await companies.insertOne(company);
+        const created = documentoPublicoCRM(company);
+        emitirCliente('company_updated', created);
+        res.status(201).json(created);
+    } catch (error) {
+        console.error('Error creating company:', error);
+        res.status(500).json({ error: 'Error al crear empresa.' });
+    }
+});
+
+app.put('/api/companies/:id', upload.single('logo'), async (req, res) => {
+    try {
+        const companies = coleccionCRM('companies');
+        const existing = await documentoPorId(companies, req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Empresa no encontrada.' });
+        const patch = { updatedAt: new Date() };
+        if (req.body?.nombre !== undefined) {
+            const nombre = textoVisible(req.body.nombre);
+            if (!nombre) return res.status(400).json({ error: 'El nombre de la empresa es obligatorio.' });
+            const normalizado = textoNormalizado(nombre);
+            const duplicate = await documentoPorNombre(companies, normalizado);
+            if (duplicate && String(duplicate._id) !== String(existing._id)) return res.status(409).json({ error: 'Ya existe una empresa con ese nombre.' });
+            patch.nombre = nombre; patch.nombreNormalizado = normalizado;
+        }
+        if (req.file) patch.logo = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+        const result = await companies.findOneAndUpdate({ _id: existing._id }, { $set: patch }, { returnDocument: 'after' });
+        const updated = result?.value || result;
+        const publicCompany = documentoPublicoCRM(updated);
+        emitirCliente('company_updated', publicCompany);
+        res.json(publicCompany);
+    } catch (error) {
+        console.error('Error updating company:', error);
+        res.status(500).json({ error: 'Error al actualizar empresa.' });
+    }
+});
+
+app.delete('/api/companies/:id', async (req, res) => {
+    try {
+        const companies = coleccionCRM('companies');
+        const existing = await documentoPorId(companies, req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Empresa no encontrada.' });
+        await companies.deleteOne({ _id: existing._id });
+        const id = String(existing._id);
+        await coleccionCRM('sites').updateMany({ $or: [{ empresaId: id }, { companyId: id }] }, { $set: { empresaId: '', companyId: '', updatedAt: new Date() } });
+        emitirCliente('company_deleted', { id });
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error deleting company:', error);
+        res.status(500).json({ error: 'Error al eliminar empresa.' });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Clientes / sedes operativas
+// ---------------------------------------------------------------------------
 app.get('/api/sites', async (req, res) => {
     try {
-        const sites = await mongoose.connection.collection('sites').find({}).sort({ nombre: 1 }).toArray();
-        res.json(sites.map(s => {
-            if(s._id) { s.id = s._id.toString(); delete s._id; }
-            return s;
-        }));
+        const sites = await coleccionCRM('sites').find({}).sort({ nombre: 1 }).toArray();
+        res.json(sites.map(clientePublico));
     } catch (error) {
         console.error('Error fetching sites:', error);
         res.status(500).json({ error: 'No se pudieron obtener los clientes.' });
@@ -642,97 +824,89 @@ app.get('/api/sites', async (req, res) => {
 
 app.post('/api/sites', upload.single('logo'), async (req, res) => {
     try {
-        const { nombre, ubicacion, empresaId } = req.body;
-        if (!nombre) return res.status(400).json({ error: 'El nombre es obligatorio' });
-        
-        let logoBase64 = null;
-        if (req.file) {
-            logoBase64 = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
-        }
-
-        const newSite = {
-            nombre,
-            ubicacion: ubicacion || '',
-            empresaId: empresaId || '',
-            logo: logoBase64,
-            createdAt: new Date(),
-            updatedAt: new Date()
+        const nombre = textoVisible(req.body?.nombre);
+        if (!nombre) return res.status(400).json({ error: 'El nombre es obligatorio.' });
+        const sites = coleccionCRM('sites');
+        const normalizado = textoNormalizado(nombre);
+        const existente = await documentoPorNombre(sites, normalizado);
+        if (existente) return res.status(409).json({ error: 'Ya existe un cliente con ese nombre.', data: clientePublico(existente) });
+        const empresaId = String(req.body?.empresaId ?? req.body?.companyId ?? '').trim();
+        const now = new Date();
+        const site = {
+            _id: new mongoose.Types.ObjectId(), nombre, nombreNormalizado: normalizado,
+            ubicacion: textoVisible(req.body?.ubicacion), empresaId, companyId: empresaId,
+            logo: req.file ? `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}` : null,
+            origen: 'manual', createdAt: now, updatedAt: now,
         };
-
-        const result = await mongoose.connection.collection('sites').insertOne(newSite);
-        const created = await mongoose.connection.collection('sites').findOne({ _id: result.insertedId });
-        if(created._id) { created.id = created._id.toString(); delete created._id; }
-        
-        try { if (typeof io !== 'undefined' && io && typeof io.emit === 'function') io.emit('site_updated', created); } catch(_) {}
+        await sites.insertOne(site);
+        const created = clientePublico(site);
+        emitirCliente('site_updated', created);
         res.status(201).json(created);
     } catch (error) {
         console.error('Error creating site:', error);
-        res.status(500).json({ error: 'Error al crear cliente' });
+        res.status(500).json({ error: 'Error al crear cliente.' });
     }
 });
 
-app.put('/api/sites/:id', async (req, res) => {
+app.put('/api/sites/:id', upload.single('logo'), async (req, res) => {
     try {
-        const { id } = req.params;
-        const { nombre, ubicacion, empresaId } = req.body;
-        
+        const sites = coleccionCRM('sites');
+        const existing = await documentoPorId(sites, req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Cliente no encontrado.' });
         const patch = { updatedAt: new Date() };
-        if (nombre) patch.nombre = nombre;
-        if (ubicacion !== undefined) patch.ubicacion = ubicacion;
-        if (empresaId !== undefined) patch.empresaId = empresaId;
-
-        const result = await mongoose.connection.collection('sites').findOneAndUpdate(
-            { _id: new mongoose.Types.ObjectId(id) },
-            { $set: patch },
-            { returnDocument: 'after' }
-        );
-        
-        if (!result) return res.status(404).json({ error: 'Cliente no encontrado' });
-        if(result._id) { result.id = result._id.toString(); delete result._id; }
-        
-        try { if (typeof io !== 'undefined' && io && typeof io.emit === 'function') io.emit('site_updated', result); } catch(_) {}
-        res.json(result);
+        if (req.body?.nombre !== undefined) {
+            const nombre = textoVisible(req.body.nombre);
+            if (!nombre) return res.status(400).json({ error: 'El nombre es obligatorio.' });
+            const normalizado = textoNormalizado(nombre);
+            const duplicate = await documentoPorNombre(sites, normalizado);
+            if (duplicate && String(duplicate._id) !== String(existing._id)) return res.status(409).json({ error: 'Ya existe un cliente con ese nombre.' });
+            patch.nombre = nombre; patch.nombreNormalizado = normalizado;
+        }
+        if (req.body?.ubicacion !== undefined) patch.ubicacion = textoVisible(req.body.ubicacion);
+        if (req.body?.empresaId !== undefined || req.body?.companyId !== undefined) {
+            const empresaId = String(req.body?.empresaId ?? req.body?.companyId ?? '').trim();
+            patch.empresaId = empresaId; patch.companyId = empresaId;
+        }
+        if (req.file) patch.logo = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+        const result = await sites.findOneAndUpdate({ _id: existing._id }, { $set: patch }, { returnDocument: 'after' });
+        const updated = result?.value || result;
+        const publicSite = clientePublico(updated);
+        emitirCliente('site_updated', publicSite);
+        res.json(publicSite);
     } catch (error) {
         console.error('Error updating site:', error);
-        res.status(500).json({ error: 'Error al actualizar cliente' });
+        res.status(500).json({ error: 'Error al actualizar cliente.' });
     }
 });
 
 app.put('/api/sites/:id/logo', upload.single('logo'), async (req, res) => {
     try {
-        const { id } = req.params;
-        if (!req.file) return res.status(400).json({ error: 'Logo no proporcionado' });
-        
-        const logoBase64 = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
-        
-        const result = await mongoose.connection.collection('sites').findOneAndUpdate(
-            { _id: new mongoose.Types.ObjectId(id) },
-            { $set: { logo: logoBase64, updatedAt: new Date() } },
-            { returnDocument: 'after' }
-        );
-        
-        if (!result) return res.status(404).json({ error: 'Cliente no encontrado' });
-        if(result._id) { result.id = result._id.toString(); delete result._id; }
-        
-        try { if (typeof io !== 'undefined' && io && typeof io.emit === 'function') io.emit('site_updated', result); } catch(_) {}
-        res.json(result);
+        if (!req.file) return res.status(400).json({ error: 'Logo no proporcionado.' });
+        const sites = coleccionCRM('sites');
+        const existing = await documentoPorId(sites, req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Cliente no encontrado.' });
+        const result = await sites.findOneAndUpdate({ _id: existing._id }, { $set: { logo: `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`, updatedAt: new Date() } }, { returnDocument: 'after' });
+        const updated = clientePublico(result?.value || result);
+        emitirCliente('site_updated', updated);
+        res.json(updated);
     } catch (error) {
         console.error('Error updating site logo:', error);
-        res.status(500).json({ error: 'Error al actualizar logo' });
+        res.status(500).json({ error: 'Error al actualizar logo.' });
     }
 });
 
 app.delete('/api/sites/:id', async (req, res) => {
     try {
-        const { id } = req.params;
-        const result = await mongoose.connection.collection('sites').findOneAndDelete({ _id: new mongoose.Types.ObjectId(id) });
-        if (!result) return res.status(404).json({ error: 'Cliente no encontrado' });
-        
-        try { if (typeof io !== 'undefined' && io && typeof io.emit === 'function') io.emit('site_deleted', { id }); } catch(_) {}
+        const sites = coleccionCRM('sites');
+        const existing = await documentoPorId(sites, req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Cliente no encontrado.' });
+        await sites.deleteOne({ _id: existing._id });
+        const id = String(existing._id);
+        emitirCliente('site_deleted', { id });
         res.json({ success: true });
     } catch (error) {
         console.error('Error deleting site:', error);
-        res.status(500).json({ error: 'Error al eliminar cliente' });
+        res.status(500).json({ error: 'Error al eliminar cliente.' });
     }
 });
 // ============================================================================
@@ -1172,6 +1346,10 @@ app.post('/api/cotizaciones', async (req, res) => {
         const actor = actorCotizacion(req);
         data.partidas = (Array.isArray(data.partidas) ? data.partidas : []).map(linea => payloadLinea('partidas', linea, actor));
         data.productosSugeridos = (Array.isArray(data.productosSugeridos) ? data.productosSugeridos : []).map(linea => payloadLinea('productosSugeridos', linea, actor));
+        // Un borrador colaborativo no crea catálogos por el simple hecho de
+        // teclear. El cliente nuevo se registra únicamente al confirmar la
+        // cotización.
+        const clienteResultado = data.esBorrador === true ? null : await asegurarClienteCotizacion(data);
 
         // Generar folio único — si hay colisión por concurrencia, reintentamos
         const folioManual = data.folio && data.folio.trim() !== '' && data.folio !== 'Sin folio' && data.folio !== 'Asignación Automática';
@@ -1201,7 +1379,7 @@ app.post('/api/cotizaciones', async (req, res) => {
         recalcularCotizacion(newCotizacion);
         await newCotizacion.save();
         try { if (global.io) global.io.emit('cotizacion_creada', newCotizacion); } catch(_) {}
-        res.json({ message: 'Cotización creada con éxito', data: newCotizacion });
+        res.json({ message: 'Cotización creada con éxito', data: newCotizacion, cliente: clienteResultado?.cliente || null, clienteCreado: Boolean(clienteResultado?.creado) });
     } catch(err) {
         if (err.code === 11000) {
             // Error de índice único en MongoDB (race condition extrema)
@@ -1222,13 +1400,22 @@ app.patch('/api/cotizaciones/:id/campos', async (req, res) => {
         });
         const cot = await CRMCotizacion.findById(req.params.id);
         if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
+        let clienteResultado = null;
+        // Esta marca solo llega desde el botón Guardar al confirmar el
+        // borrador. Los autosaves de texto no dan de alta clientes todavía.
+        if (cambios.esBorrador === false) {
+            const candidato = { ...(cot.toObject?.() || cot), ...cambios };
+            clienteResultado = await asegurarClienteCotizacion(candidato);
+            cambios.clienteId = candidato.clienteId || '';
+            cambios.clienteNombre = candidato.clienteNombre || '';
+        }
         Object.assign(cot, cambios);
         cot.revision = valorNumero(cot.revision) + 1;
         cot.colaboracionActualizadaEn = new Date();
         await cot.save();
         const evento = { tipo: 'campos', cotizacionId: String(cot._id), cambios, revision: cot.revision, actorId: actorCotizacion(req), clientId: clientCotizacion(req) };
         emitirColaboracion(String(cot._id), evento);
-        res.json({ data: cot, revision: cot.revision });
+        res.json({ data: cot, revision: cot.revision, cliente: clienteResultado?.cliente || null, clienteCreado: Boolean(clienteResultado?.creado) });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1307,6 +1494,7 @@ app.put('/api/cotizaciones/:id', async (req, res) => {
         const data = req.body;
         const anterior = await CRMCotizacion.findById(id);
         if (!anterior) return res.status(404).json({ error: 'Cotización no encontrada' });
+        const clienteResultado = data.esBorrador === true ? null : await asegurarClienteCotizacion(data);
 
         // Compatibilidad para clientes que aún usan PUT completo: los nuevos
         // renglones reciben identidad/autor y los existentes conservan la suya.
@@ -1339,7 +1527,7 @@ app.put('/api/cotizaciones/:id', async (req, res) => {
         }
 
         try { if (global.io) global.io.emit('cotizacion_actualizada', updatedCot); } catch(_) {}
-        res.json({ message: 'Cotización actualizada con éxito', data: updatedCot });
+        res.json({ message: 'Cotización actualizada con éxito', data: updatedCot, cliente: clienteResultado?.cliente || null, clienteCreado: Boolean(clienteResultado?.creado) });
     } catch(err) {
         res.status(500).json({ error: err.message });
     }
