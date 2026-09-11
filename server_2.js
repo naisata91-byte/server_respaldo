@@ -230,7 +230,14 @@ const UserRefSchema = new mongoose.Schema({
     nombre: String, apellido: String, telefono: String,
     correo: String, password: String, rol: String, estadoCuenta: String, tokenPortal: String,
     categoria: { type: String, enum: ['Electricidad', 'Voz y Datos', 'Aires Acondicionados', 'Aislamiento', 'Tablaroca'], default: '' },
-    sueldoBase: { type: Number, default: 0 }
+    sueldoBase: { type: Number, default: 0 },
+    permisosCrm: [String],
+    sessionVersion: { type: Number, default: 0 },
+    accesoCrm: {
+        estado: { type: String, default: 'activo' },
+        actualizadoEn: Date,
+        actualizadoPor: String
+    }
 }, { collection: 'users' });
 
 // Schema de lectura cruzada: Tickets/Entregables de la app principal
@@ -729,7 +736,7 @@ app.get('/api/usuarios', async (req, res) => {
 // Obtener perfil de usuario por ID (incluye `categoria`)
 app.get('/api/users/:id', async (req, res) => {
     try {
-        const user = await UserRef.findById(req.params.id);
+        const user = await UserRef.findById(req.params.id).select('-password -tokenPortal');
         if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
         res.json(user);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -2819,6 +2826,36 @@ function hashPassword(password) {
     return crypto.createHash('sha256').update(password).digest('hex');
 }
 
+// Compatibilidad progresiva: las cuentas históricas usan texto plano; las
+// creadas desde Expedientes usan scrypt. Cuando una cuenta antigua inicia
+// correctamente se actualiza a scrypt sin forzar un cambio de contraseña.
+function verificarPasswordEmpleado(password, storedPassword) {
+    const stored = String(storedPassword || '');
+    if (!stored.startsWith('scrypt$')) return stored === String(password);
+    const [, salt, expected] = stored.split('$');
+    if (!salt || !expected) return false;
+    const derived = crypto.scryptSync(String(password), salt, 64).toString('hex');
+    const a = Buffer.from(derived, 'hex');
+    const b = Buffer.from(expected, 'hex');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function protegerPasswordEmpleado(password) {
+    const salt = crypto.randomBytes(16).toString('hex');
+    return `scrypt$${salt}$${crypto.scryptSync(String(password), salt, 64).toString('hex')}`;
+}
+
+function cuentaEmpleadoPermitida(estado) {
+    return !['pendiente', 'rechazada', 'inactiva', 'suspendida', 'revocada'].includes(String(estado || '').toLowerCase());
+}
+
+function empleadoPublico(empleado) {
+    const data = empleado && typeof empleado.toObject === 'function' ? empleado.toObject() : { ...(empleado || {}) };
+    delete data.password;
+    delete data.tokenPortal;
+    return data;
+}
+
 function generateToken() {
     return crypto.randomBytes(32).toString('hex');
 }
@@ -2867,21 +2904,23 @@ app.post('/api/login', async (req, res) => {
             return res.status(401).json({ error: 'Credenciales inválidas.' });
         }
 
-        if (empleado.password !== password) {
+        if (!verificarPasswordEmpleado(password, empleado.password)) {
             return res.status(401).json({ error: 'Credenciales inválidas.' });
         }
 
-        if (empleado.estadoCuenta === 'pendiente') {
-            return res.status(403).json({ error: 'Tu cuenta está pendiente de aprobación.' });
+        if (!cuentaEmpleadoPermitida(empleado.estadoCuenta)) {
+            return res.status(403).json({ error: 'Tu acceso al CRM está pendiente, suspendido o revocado. Contacta a un administrador.' });
         }
-        if (empleado.estadoCuenta === 'rechazada') {
-            return res.status(403).json({ error: 'Tu cuenta ha sido rechazada.' });
+
+        if (!String(empleado.password || '').startsWith('scrypt$')) {
+            empleado.password = protegerPasswordEmpleado(password);
+            await empleado.save();
         }
 
         // Devolvemos el empleado completo en el objeto "user" como espera el frontend
         return res.json({ 
             message: 'Login exitoso', 
-            user: empleado 
+            user: empleadoPublico(empleado)
         });
 
     } catch (error) {
@@ -2903,18 +2942,21 @@ app.post('/api/clientes/login', async (req, res) => {
         if (empleado) {
             const isMaster = (searchCorreo === 'jonathan@naisata.com');
             
-            if (empleado.password !== password) {
+            if (!verificarPasswordEmpleado(password, empleado.password)) {
                 return res.status(401).json({ error: 'Credenciales inválidas.' });
             }
 
             if (!isMaster) {
-                if (empleado.estadoCuenta === 'pendiente') return res.status(403).json({ error: 'Tu cuenta está pendiente de aprobación.', pendiente: true });
-                if (empleado.estadoCuenta === 'rechazada') return res.status(403).json({ error: 'Tu cuenta ha sido rechazada.' });
+                if (!cuentaEmpleadoPermitida(empleado.estadoCuenta)) return res.status(403).json({ error: 'Tu acceso al CRM está pendiente, suspendido o revocado.', pendiente: true });
                 
                 // Solo admin puede entrar al portal desde la colección de usuarios (o si quieres permitir todos, quita este if)
                 if (empleado.rol !== 'admin' && empleado.rol !== 'socio') {
                     return res.status(403).json({ error: 'Tu rol no tiene permiso para ingresar como administrador al portal.' });
                 }
+            }
+
+            if (!String(empleado.password || '').startsWith('scrypt$')) {
+                empleado.password = protegerPasswordEmpleado(password);
             }
 
             const token = generateToken();
