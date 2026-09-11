@@ -175,6 +175,17 @@ const io = new Server(server, {
 });
 global.io = io; // Expose io globally to routes
 
+io.on('connection', socket => {
+    socket.on('cotizacion:unirse', data => {
+        const cotizacionId = String(data?.cotizacionId || '').trim();
+        if (cotizacionId) socket.join(`cotizacion:${cotizacionId}`);
+    });
+    socket.on('cotizacion:salir', data => {
+        const cotizacionId = String(data?.cotizacionId || '').trim();
+        if (cotizacionId) socket.leave(`cotizacion:${cotizacionId}`);
+    });
+});
+
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '100mb' }));
@@ -294,21 +305,29 @@ const CRMCotizacionSchema = new mongoose.Schema({
         default: 'Neutral' 
     },
     partidas: [{
+        lineaId: String,
         descripcion: String,
         cantidad: Number,
         um: String,
         precioUnitario: Number,
-        total: Number
+        total: Number,
+        creadoPor: String,
+        actualizadoPor: String,
+        actualizadoEn: Date
     }],
     subtotal: Number,
     iva: Number,
     total: Number,
     productosSugeridos: [{
+        lineaId: String,
         cantidad: Number,
         numeroParte: String,
         marca: String,
         descripcion: String,
-        costo: Number
+        costo: Number,
+        creadoPor: String,
+        actualizadoPor: String,
+        actualizadoEn: Date
     }],
     fechaCreacion: { type: Date, default: Date.now },
     fechaSeguimiento: Date,
@@ -318,9 +337,64 @@ const CRMCotizacionSchema = new mongoose.Schema({
     accesosPortal: [String], // IDs de clientes del portal con acceso
     permisosPortalModificacion: [String], // IDs de clientes con permiso para modificar
     cotizacionOriginalId: String, // Referencia a la original si esta es copia modificada
-    esModificadaPorCliente: { type: Boolean, default: false } // Bandera de si fue hecha por cliente
+    esModificadaPorCliente: { type: Boolean, default: false }, // Bandera de si fue hecha por cliente
+    esBorrador: { type: Boolean, default: false },
+    revision: { type: Number, default: 0 },
+    colaboracionActualizadaEn: Date
 });
 const CRMCotizacion = mongoose.model('CRMCotizacion', CRMCotizacionSchema);
+
+// ─── Colaboración de cotizaciones ──────────────────────────────────────────
+// Las partidas y productos se modifican como renglones independientes. Así un
+// cambio de CCTV no reemplaza el arreglo que otro usuario está editando.
+function nuevaLineaId() { return new mongoose.Types.ObjectId().toString(); }
+function actorCotizacion(req) {
+    return String(req.headers['x-crm-user-id'] || req.body?.actorId || 'usuario').slice(0, 120);
+}
+function clientCotizacion(req) {
+    return String(req.headers['x-cotizacion-client-id'] || '').slice(0, 120);
+}
+function valorNumero(value, fallback = 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+}
+function normalizarLineasCotizacion(cot) {
+    let changed = false;
+    ['partidas', 'productosSugeridos'].forEach(tipo => {
+        (cot[tipo] || []).forEach(linea => {
+            if (!linea.lineaId) { linea.lineaId = nuevaLineaId(); changed = true; }
+            if (!linea.actualizadoEn) { linea.actualizadoEn = cot.fechaCreacion || new Date(); changed = true; }
+        });
+    });
+    return changed;
+}
+function recalcularCotizacion(cot) {
+    const subtotal = (cot.partidas || []).reduce((sum, partida) => {
+        partida.total = valorNumero(partida.cantidad) * valorNumero(partida.precioUnitario);
+        return sum + partida.total;
+    }, 0);
+    cot.subtotal = subtotal;
+    cot.total = subtotal;
+}
+function payloadLinea(tipo, input, actor, existing = {}) {
+    const now = new Date();
+    if (tipo === 'partidas') return {
+        lineaId: existing.lineaId || String(input.lineaId || nuevaLineaId()),
+        descripcion: String(input.descripcion || ''), cantidad: valorNumero(input.cantidad),
+        um: String(input.um || input.unidad || 'mts'), precioUnitario: valorNumero(input.precioUnitario),
+        total: valorNumero(input.cantidad) * valorNumero(input.precioUnitario),
+        creadoPor: existing.creadoPor || actor, actualizadoPor: actor, actualizadoEn: now,
+    };
+    return {
+        lineaId: existing.lineaId || String(input.lineaId || nuevaLineaId()),
+        cantidad: valorNumero(input.cantidad, 1), numeroParte: String(input.numeroParte || ''),
+        marca: String(input.marca || ''), descripcion: String(input.descripcion || ''), costo: valorNumero(input.costo),
+        creadoPor: existing.creadoPor || actor, actualizadoPor: actor, actualizadoEn: now,
+    };
+}
+function emitirColaboracion(cotizacionId, evento) {
+    try { if (global.io) global.io.to(`cotizacion:${cotizacionId}`).emit('cotizacion_colaboracion', evento); } catch (_) {}
+}
 
 const CRMProyectoSchema = new mongoose.Schema({
     _id: { type: String, default: () => new mongoose.Types.ObjectId().toString() },
@@ -1018,6 +1092,8 @@ app.get('/api/cotizaciones/:id', async (req, res) => {
     try {
         const cot = await CRMCotizacion.findById(req.params.id);
         if (!cot) return res.status(404).json({ error: 'No encontrado' });
+        // Migración transparente de cotizaciones anteriores al modo colaborativo.
+        if (normalizarLineasCotizacion(cot)) await cot.save();
         res.json(cot);
     } catch(err) { res.status(500).json({error: err.message}); }
 });
@@ -1035,6 +1111,9 @@ app.get('/api/cotizaciones/:id/version-cliente', async (req, res) => {
 app.post('/api/cotizaciones', async (req, res) => {
     try {
         const data = req.body;
+        const actor = actorCotizacion(req);
+        data.partidas = (Array.isArray(data.partidas) ? data.partidas : []).map(linea => payloadLinea('partidas', linea, actor));
+        data.productosSugeridos = (Array.isArray(data.productosSugeridos) ? data.productosSugeridos : []).map(linea => payloadLinea('productosSugeridos', linea, actor));
 
         // Generar folio único — si hay colisión por concurrencia, reintentamos
         const folioManual = data.folio && data.folio.trim() !== '' && data.folio !== 'Sin folio' && data.folio !== 'Asignación Automática';
@@ -1060,7 +1139,8 @@ app.post('/api/cotizaciones', async (req, res) => {
             data.folio = folioGenerado;
         }
 
-        const newCotizacion = new CRMCotizacion(data);
+        const newCotizacion = new CRMCotizacion({ ...data, revision: 1, colaboracionActualizadaEn: new Date() });
+        recalcularCotizacion(newCotizacion);
         await newCotizacion.save();
         try { if (global.io) global.io.emit('cotizacion_creada', newCotizacion); } catch(_) {}
         res.json({ message: 'Cotización creada con éxito', data: newCotizacion });
@@ -1073,10 +1153,111 @@ app.post('/api/cotizaciones', async (req, res) => {
     }
 });
 
+// Actualiza exclusivamente campos generales. Las partidas y productos usan sus
+// propias rutas para que nunca se pisen entre usuarios.
+app.patch('/api/cotizaciones/:id/campos', async (req, res) => {
+    try {
+        const permitidos = ['clienteId', 'clienteNombre', 'descripcion', 'lugarEjecucion', 'contacto', 'categoria', 'condiciones', 'notas', 'estado', 'fechaSeguimiento', 'requiereRevision', 'esBorrador'];
+        const cambios = {};
+        permitidos.forEach(campo => {
+            if (Object.prototype.hasOwnProperty.call(req.body || {}, campo)) cambios[campo] = req.body[campo];
+        });
+        const cot = await CRMCotizacion.findById(req.params.id);
+        if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
+        Object.assign(cot, cambios);
+        cot.revision = valorNumero(cot.revision) + 1;
+        cot.colaboracionActualizadaEn = new Date();
+        await cot.save();
+        const evento = { tipo: 'campos', cotizacionId: String(cot._id), cambios, revision: cot.revision, actorId: actorCotizacion(req), clientId: clientCotizacion(req) };
+        emitirColaboracion(String(cot._id), evento);
+        res.json({ data: cot, revision: cot.revision });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+function crearRutasLineasCotizacion(tipo, campo) {
+    app.post(`/api/cotizaciones/:id/${tipo}`, async (req, res) => {
+        try {
+            const cot = await CRMCotizacion.findById(req.params.id);
+            if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
+            normalizarLineasCotizacion(cot);
+            const actor = actorCotizacion(req);
+            const linea = payloadLinea(campo, req.body?.linea || req.body || {}, actor);
+            cot[campo].push(linea);
+            recalcularCotizacion(cot);
+            cot.revision = valorNumero(cot.revision) + 1;
+            cot.colaboracionActualizadaEn = new Date();
+            await cot.save();
+            const saved = cot[campo].find(item => item.lineaId === linea.lineaId);
+            const evento = { tipo: 'crear_linea', coleccion: campo, cotizacionId: String(cot._id), linea: saved?.toObject?.() || saved, revision: cot.revision, actorId: actor, clientId: clientCotizacion(req) };
+            emitirColaboracion(String(cot._id), evento);
+            res.status(201).json({ linea: evento.linea, revision: cot.revision });
+        } catch (err) { res.status(400).json({ error: err.message }); }
+    });
+
+    app.patch(`/api/cotizaciones/:id/${tipo}/:lineaId`, async (req, res) => {
+        try {
+            const cot = await CRMCotizacion.findById(req.params.id);
+            if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
+            normalizarLineasCotizacion(cot);
+            const linea = (cot[campo] || []).find(item => item.lineaId === req.params.lineaId);
+            if (!linea) return res.status(404).json({ error: 'Renglón no encontrado' });
+            const base = req.body?.baseActualizadoEn;
+            if (base && linea.actualizadoEn && new Date(linea.actualizadoEn).getTime() > new Date(base).getTime()) {
+                return res.status(409).json({ error: 'Este renglón fue actualizado por otra persona.', conflicto: true, linea: linea.toObject?.() || linea, revision: cot.revision || 0 });
+            }
+            const actor = actorCotizacion(req);
+            const actualizado = payloadLinea(campo, { ...(linea.toObject?.() || linea), ...(req.body?.linea || req.body || {}), lineaId: linea.lineaId }, actor, linea);
+            Object.assign(linea, actualizado);
+            recalcularCotizacion(cot);
+            cot.revision = valorNumero(cot.revision) + 1;
+            cot.colaboracionActualizadaEn = new Date();
+            await cot.save();
+            const evento = { tipo: 'actualizar_linea', coleccion: campo, cotizacionId: String(cot._id), linea: linea.toObject?.() || linea, revision: cot.revision, actorId: actor, clientId: clientCotizacion(req) };
+            emitirColaboracion(String(cot._id), evento);
+            res.json({ linea: evento.linea, revision: cot.revision });
+        } catch (err) { res.status(400).json({ error: err.message }); }
+    });
+
+    app.delete(`/api/cotizaciones/:id/${tipo}/:lineaId`, async (req, res) => {
+        try {
+            const cot = await CRMCotizacion.findById(req.params.id);
+            if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
+            normalizarLineasCotizacion(cot);
+            const index = (cot[campo] || []).findIndex(item => item.lineaId === req.params.lineaId);
+            if (index < 0) return res.status(404).json({ error: 'Renglón no encontrado' });
+            cot[campo].splice(index, 1);
+            recalcularCotizacion(cot);
+            cot.revision = valorNumero(cot.revision) + 1;
+            cot.colaboracionActualizadaEn = new Date();
+            await cot.save();
+            const evento = { tipo: 'eliminar_linea', coleccion: campo, cotizacionId: String(cot._id), lineaId: req.params.lineaId, revision: cot.revision, actorId: actorCotizacion(req), clientId: clientCotizacion(req) };
+            emitirColaboracion(String(cot._id), evento);
+            res.json({ success: true, revision: cot.revision });
+        } catch (err) { res.status(400).json({ error: err.message }); }
+    });
+}
+crearRutasLineasCotizacion('partidas', 'partidas');
+crearRutasLineasCotizacion('productos-sugeridos', 'productosSugeridos');
+
 app.put('/api/cotizaciones/:id', async (req, res) => {
     try {
         const { id } = req.params;
         const data = req.body;
+        const anterior = await CRMCotizacion.findById(id);
+        if (!anterior) return res.status(404).json({ error: 'Cotización no encontrada' });
+
+        // Compatibilidad para clientes que aún usan PUT completo: los nuevos
+        // renglones reciben identidad/autor y los existentes conservan la suya.
+        ['partidas', 'productosSugeridos'].forEach(campo => {
+            if (!Array.isArray(data[campo])) return;
+            const previas = anterior[campo] || [];
+            data[campo] = data[campo].map((linea, index) => {
+                const previa = previas.find(item => item.lineaId && item.lineaId === linea.lineaId) || previas[index] || {};
+                return payloadLinea(campo, linea, actorCotizacion(req), previa);
+            });
+        });
+        data.revision = valorNumero(anterior.revision) + 1;
+        data.colaboracionActualizadaEn = new Date();
         
         // Prevent overwriting the folio with an empty string or default labels which trigger duplicate key E11000
         if (data.folio === '' || data.folio === 'Asignación Automática' || data.folio === 'Sin folio') {
@@ -1084,7 +1265,6 @@ app.put('/api/cotizaciones/:id', async (req, res) => {
         }
 
         const updatedCot = await CRMCotizacion.findByIdAndUpdate(id, data, { returnDocument: 'after' });
-        if (!updatedCot) return res.status(404).json({ error: 'Cotización no encontrada' });
 
         // Sincronizar la descripción en el Proyecto Operativo Activo (si existe)
         if (updatedCot.proyectoActivoId && data.descripcion !== undefined) {
