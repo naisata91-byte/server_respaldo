@@ -2831,13 +2831,34 @@ function hashPassword(password) {
 // correctamente se actualiza a scrypt sin forzar un cambio de contraseña.
 function verificarPasswordEmpleado(password, storedPassword) {
     const stored = String(storedPassword || '');
-    if (!stored.startsWith('scrypt$')) return stored === String(password);
-    const [, salt, expected] = stored.split('$');
-    if (!salt || !expected) return false;
-    const derived = crypto.scryptSync(String(password), salt, 64).toString('hex');
-    const a = Buffer.from(derived, 'hex');
-    const b = Buffer.from(expected, 'hex');
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
+    if (!stored || !password) return false;
+
+    // 1. scrypt
+    if (stored.startsWith('scrypt$')) {
+        const [, salt, expected] = stored.split('$');
+        if (!salt || !expected) return false;
+        try {
+            const derived = crypto.scryptSync(String(password), salt, 64).toString('hex');
+            const a = Buffer.from(derived, 'hex');
+            const b = Buffer.from(expected, 'hex');
+            return a.length === b.length && crypto.timingSafeEqual(a, b);
+        } catch (_) {
+            return false;
+        }
+    }
+
+    // 2. bcrypt ($2a$, $2b$, $2y$)
+    if (/^\$2[aby]\$\d+\$/.test(stored)) {
+        try {
+            const bcrypt = require('bcryptjs');
+            return bcrypt.compareSync(String(password), stored);
+        } catch (_) {
+            return false;
+        }
+    }
+
+    // 3. Texto plano histórico
+    return stored === String(password);
 }
 
 function protegerPasswordEmpleado(password) {
@@ -2912,7 +2933,7 @@ app.post('/api/login', async (req, res) => {
             return res.status(403).json({ error: 'Tu acceso al CRM está pendiente, suspendido o revocado. Contacta a un administrador.' });
         }
 
-        if (!String(empleado.password || '').startsWith('scrypt$')) {
+        if (!String(empleado.password || '').startsWith('scrypt$') && !/^\$2[aby]\$\d+\$/.test(String(empleado.password || ''))) {
             empleado.password = protegerPasswordEmpleado(password);
             await empleado.save();
         }
