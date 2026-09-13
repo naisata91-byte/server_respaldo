@@ -246,7 +246,7 @@ app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // MongoDB Connection
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://jairanaisata_db_user:Hola2025@cluster0.bpnkdj6.mongodb.net/naisata_db?appName=Cluster0';
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://jarvis:Hola2025@cluster0.jih3lub.mongodb.net/naisata_db?appName=Cluster0';
 
 mongoose.connect(MONGODB_URI, {
     serverSelectionTimeoutMS: 30000,
@@ -313,7 +313,8 @@ const TicketRefSchema = new mongoose.Schema({
     firmaCliente: String, // Si tiene valor = entregable firmado
     nombreCliente: String,
     folio: String,
-    estado: String
+    estado: String,
+    createdAt: Date
 }, { collection: 'tickets' });
 
 const VehicleTransactionRef = mongoose.model('VehicleTransactionRef', VehicleTransactionRefSchema);
@@ -473,6 +474,7 @@ const CRMProyectoSchema = new mongoose.Schema({
         descripcion: String,
         monto: Number,
         tipo: { type: String, enum: ['Ingreso', 'Egreso'] },
+        pagada: { type: Boolean, default: false },
         archivoUrl: String, // PDF o Imagen
         fecha: { type: Date, default: Date.now }
     }],
@@ -1696,57 +1698,89 @@ app.post('/api/proyectos', async (req, res) => {
     } catch(err) { res.status(500).json({error: err.message}); }
 });
 
+function consultaEntregablesProyecto(proyecto) {
+    const idProyecto = String(proyecto._id);
+    const folio = String(proyecto.folio || '').trim();
+    const vinculaciones = [{ proyectoId: idProyecto }];
+
+    // Compatibilidad con entregables históricos que se guardaron usando el folio.
+    if (folio) {
+        vinculaciones.push(
+            { proyectoId: folio },
+            { proyectoId: { $regex: folio, $options: 'i' } },
+            { folio },
+            { folio: { $regex: folio, $options: 'i' } }
+        );
+    }
+    return { $or: vinculaciones };
+}
+
+async function obtenerValidacionCierre(proyecto) {
+    const consultaTicket = consultaEntregablesProyecto(proyecto);
+    const [entregable, entregableFirmado, cotizacion] = await Promise.all([
+        TicketRef.findOne(consultaTicket).sort({ createdAt: -1 }).select('_id siteId proyectoId folio firmaCliente estado'),
+        TicketRef.findOne({ ...consultaTicket, firmaCliente: { $exists: true, $nin: [null, ''] } }).sort({ createdAt: -1 }).select('_id siteId proyectoId folio firmaCliente estado'),
+        proyecto.cotizacionId ? CRMCotizacion.findById(proyecto.cotizacionId).select('total') : null
+    ]);
+
+    const facturas = proyecto.facturas || [];
+    const totalFacturado = facturas.reduce((total, factura) => total + (Number(factura.monto) || 0), 0);
+    const totalCotizacion = cotizacion && Number.isFinite(Number(cotizacion.total)) ? Number(cotizacion.total) : null;
+    const facturacionCompleta = totalCotizacion === null || Math.abs(totalFacturado - totalCotizacion) <= 1;
+    // Facturas existentes de antes de esta mejora no tienen el campo pagada y
+    // por seguridad quedan como pendientes hasta que alguien las confirme.
+    const todasFacturasPagadas = facturas.every(factura => factura.pagada === true);
+    const avanceCompleto = Number(proyecto.porcentajeAvance || 0) === 100;
+
+    const requisitos = [
+        { clave: 'entregable', etiqueta: 'Entregable firmado por el cliente', completo: Boolean(entregableFirmado) },
+        { clave: 'facturacion', etiqueta: 'La facturación coincide con la cotización', completo: facturacionCompleta },
+        { clave: 'pagos', etiqueta: 'Todas las facturas están pagadas', completo: todasFacturasPagadas },
+        { clave: 'avance', etiqueta: 'El avance global está al 100%', completo: avanceCompleto }
+    ];
+
+    return {
+        puedeCerrar: requisitos.every(requisito => requisito.completo),
+        requisitos,
+        entregable: entregable ? {
+            id: String(entregable._id), siteId: entregable.siteId || '',
+            proyectoId: entregable.proyectoId || '', folio: entregable.folio || '',
+            firmado: Boolean(entregable.firmaCliente), estado: entregable.estado || ''
+        } : null,
+        totalFacturado,
+        totalCotizacion,
+        facturasPendientes: facturas.filter(factura => factura.pagada !== true).length,
+        porcentajeAvance: Number(proyecto.porcentajeAvance || 0)
+    };
+}
+
+app.get('/api/proyectos/:id/validacion-cierre', async (req, res) => {
+    try {
+        const proyecto = await CRMProyecto.findById(req.params.id);
+        if (!proyecto) return res.status(404).json({ error: 'Proyecto no encontrado' });
+        res.json(await obtenerValidacionCierre(proyecto));
+    } catch (err) {
+        console.error('Error validando cierre de proyecto:', err);
+        res.status(500).json({ error: 'No se pudo validar el cierre del proyecto' });
+    }
+});
+
 app.put('/api/proyectos/:id', async (req, res) => {
     try {
         const { id } = req.params;
         const data = req.body;
 
-        // Validación: Si se intenta cerrar/terminar, debe existir al menos un entregable firmado
+        // El cierre se protege en el servidor para que no pueda omitirse desde la UI.
         const ESTADOS_CIERRE = ['Terminada', 'Terminado', 'Cerrada', 'Cerrado', 'Cancelado'];
         if (data.estado && ESTADOS_CIERRE.includes(data.estado)) {
             const proyecto = await CRMProyecto.findById(id);
             if (!proyecto) return res.status(404).json({ error: 'Proyecto no encontrado' });
-
-            // Se busca por: proyectoId directo, folio del proyecto, _id del proyecto o el campo folio del ticket
-            const folioProyecto = proyecto.folio || '';
-            const ticketQuery = {
-                firmaCliente: { $exists: true, $ne: null, $ne: '' },
-                $or: [
-                    { proyectoId: id },
-                    { proyectoId: folioProyecto },
-                    { proyectoId: { $regex: folioProyecto, $options: 'i' } },
-                    { folio: folioProyecto },
-                    { folio: { $regex: folioProyecto, $options: 'i' } }
-                ]
-            };
-
-            const ticketFirmado = await TicketRef.findOne(ticketQuery).select('_id folio firmaCliente');
-
-            if (!ticketFirmado) {
+            const validacion = await obtenerValidacionCierre(proyecto);
+            if (!validacion.puedeCerrar) {
+                const pendientes = validacion.requisitos.filter(requisito => !requisito.completo).map(requisito => requisito.etiqueta);
                 return res.status(422).json({
-                    error: `No se puede cerrar el proyecto "${folioProyecto}" porque no tiene ningún entregable firmado por el cliente. Genera y solicita la firma del entregable en la sección de Tickets antes de cerrar.`
-                });
-            }
-
-            // Segunda Validación: La suma de facturas debe igualar al total de la cotización (si existe cotización asociada)
-            if (proyecto.cotizacionId) {
-                const cotizacion = await CRMCotizacion.findById(proyecto.cotizacionId);
-                if (cotizacion && (cotizacion.total || cotizacion.total === 0)) {
-                    const sumaFacturas = (proyecto.facturas || []).reduce((acc, f) => acc + (f.monto || 0), 0);
-                    
-                    // Permitir margen de $1 por posibles diferencias de redondeo en decimales
-                    if (Math.abs(sumaFacturas - cotizacion.total) > 1) {
-                        return res.status(422).json({
-                            error: `No se puede cerrar el proyecto. La suma de facturas ($${sumaFacturas.toLocaleString('es-MX', {minimumFractionDigits:2})}) no coincide con el monto total de la cotización ($${cotizacion.total.toLocaleString('es-MX', {minimumFractionDigits:2})}).`
-                        });
-                    }
-                }
-            }
-
-            // Tercera Validación: El porcentaje de avance del proyecto debe ser 100%
-            if (proyecto.porcentajeAvance !== 100) {
-                return res.status(422).json({
-                    error: `No se puede cerrar el proyecto. El porcentaje de avance actual es del ${proyecto.porcentajeAvance || 0}%. Debe estar al 100% para poder finalizarlo.`
+                    error: `No se puede cerrar el proyecto "${proyecto.folio || id}". Pendiente: ${pendientes.join(', ')}.`,
+                    validacion
                 });
             }
         }
@@ -1898,11 +1932,34 @@ app.post('/api/proyectos/:id/facturas', upload.single('archivo'), async (req, re
         if (!proj) return res.status(404).send("Proyecto no encontrado");
         
         if (!proj.facturas) proj.facturas = [];
-        proj.facturas.push({ folio, monto: parseFloat(monto) || 0, archivoUrl, tipo: 'Ingreso', fecha: new Date() });
+        proj.facturas.push({ folio, monto: parseFloat(monto) || 0, archivoUrl, tipo: 'Ingreso', pagada: false, fecha: new Date() });
         await proj.save();
         res.json({ success: true, facturas: proj.facturas });
     } catch (err) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+// Confirmar o revertir el pago de una factura. Se conserva explícitamente para
+// que las facturas históricas sin el campo pagada permanezcan bloqueadas.
+app.put('/api/proyectos/:id/facturas/:facturaId/pagada', async (req, res) => {
+    try {
+        const { pagada } = req.body;
+        if (typeof pagada !== 'boolean') {
+            return res.status(400).json({ error: 'El estado pagada debe ser verdadero o falso.' });
+        }
+
+        const proyecto = await CRMProyecto.findById(req.params.id);
+        if (!proyecto) return res.status(404).json({ error: 'Proyecto no encontrado' });
+        const factura = proyecto.facturas.id(req.params.facturaId);
+        if (!factura) return res.status(404).json({ error: 'Factura no encontrada' });
+
+        factura.pagada = pagada;
+        await proyecto.save();
+        res.json({ success: true, factura, validacion: await obtenerValidacionCierre(proyecto) });
+    } catch (err) {
+        console.error('Error actualizando pago de factura:', err);
+        res.status(500).json({ error: 'No se pudo actualizar el pago de la factura.' });
     }
 });
 
