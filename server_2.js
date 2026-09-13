@@ -246,7 +246,7 @@ app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // MongoDB Connection
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://jarvis:Hola2025@cluster0.jih3lub.mongodb.net/naisata_db?appName=Cluster0';
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://jairanaisata_db_user:Hola2025@cluster0.bpnkdj6.mongodb.net/naisata_db?appName=Cluster0';
 
 mongoose.connect(MONGODB_URI, {
     serverSelectionTimeoutMS: 30000,
