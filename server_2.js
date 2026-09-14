@@ -1766,8 +1766,9 @@ async function obtenerValidacionCierre(proyecto) {
             firmado: Boolean(entregable.firmaCliente), estado: entregable.estado || ''
         } : null,
         totalFacturado,
-        totalCotizacion,
-        facturasPendientes: facturas.filter(factura => factura.pagada !== true && factura.modoAbono === true).length,
+        totalCotizacion: totalCotizacionSinIva,
+        totalCotizacionConIva,
+        facturasPendientes: facturas.filter(factura => factura.pagada !== true).length,
         porcentajeAvance: Number(proyecto.porcentajeAvance || 0)
     };
 }
