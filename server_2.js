@@ -1996,7 +1996,7 @@ app.put('/api/proyectos/:id/facturas/:facturaId/abono', async (req, res) => {
         const factura = proyecto.facturas.id(req.params.facturaId);
         if (!factura) return res.status(404).json({ error: 'Factura no encontrada' });
 
-        factura.abono = Number(abono);
+        factura.abono = (factura.abono || 0) + Number(abono);
         // Si el abono cubre el total o más, se marca como pagada
         if (factura.abono >= factura.monto) {
             factura.pagada = true;
