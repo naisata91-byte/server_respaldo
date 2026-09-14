@@ -2026,6 +2026,9 @@ app.put('/api/proyectos/:id/facturas/:facturaId/modo-abono', async (req, res) =>
         if (!factura) return res.status(404).json({ error: 'Factura no encontrada' });
 
         factura.modoAbono = modoAbono;
+        if (modoAbono && (factura.abono || 0) < factura.monto) {
+            factura.pagada = false;
+        }
         await proyecto.save();
         res.json({ success: true, factura, validacion: await obtenerValidacionCierre(proyecto) });
     } catch (err) {
