@@ -1746,10 +1746,7 @@ async function obtenerValidacionCierre(proyecto) {
     const facturacionCompleta = totalCotizacion === null || Math.abs(totalFacturado - totalCotizacion) <= 1;
     // Facturas existentes de antes de esta mejora no tienen el campo pagada y
     // por seguridad quedan como pendientes hasta que alguien las confirme.
-    const todasFacturasPagadas = facturas.every(factura =>
-        factura.pagada === true ||
-        (factura.modoAbono === false && factura.modoAbono !== undefined)
-    );
+    const todasFacturasPagadas = facturas.every(factura => factura.pagada === true);
     const avanceCompleto = Number(proyecto.porcentajeAvance || 0) === 100;
 
     const requisitos = [
