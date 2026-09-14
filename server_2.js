@@ -474,6 +474,7 @@ const CRMProyectoSchema = new mongoose.Schema({
         descripcion: String,
         monto: Number,
         abono: { type: Number, default: 0 },
+        modoAbono: { type: Boolean, default: false },
         tipo: { type: String, enum: ['Ingreso', 'Egreso'] },
         pagada: { type: Boolean, default: false },
         archivoUrl: String, // PDF o Imagen
@@ -1745,7 +1746,10 @@ async function obtenerValidacionCierre(proyecto) {
     const facturacionCompleta = totalCotizacion === null || Math.abs(totalFacturado - totalCotizacion) <= 1;
     // Facturas existentes de antes de esta mejora no tienen el campo pagada y
     // por seguridad quedan como pendientes hasta que alguien las confirme.
-    const todasFacturasPagadas = facturas.every(factura => factura.pagada === true);
+    const todasFacturasPagadas = facturas.every(factura =>
+        factura.pagada === true ||
+        (factura.modoAbono === false && factura.modoAbono !== undefined)
+    );
     const avanceCompleto = Number(proyecto.porcentajeAvance || 0) === 100;
 
     const requisitos = [
@@ -1765,7 +1769,7 @@ async function obtenerValidacionCierre(proyecto) {
         } : null,
         totalFacturado,
         totalCotizacion,
-        facturasPendientes: facturas.filter(factura => factura.pagada !== true).length,
+        facturasPendientes: facturas.filter(factura => factura.pagada !== true && factura.modoAbono === true).length,
         porcentajeAvance: Number(proyecto.porcentajeAvance || 0)
     };
 }
@@ -2008,6 +2012,27 @@ app.put('/api/proyectos/:id/facturas/:facturaId/abono', async (req, res) => {
     }
 });
 
+// Activar o desactivar el modo abono de una factura
+app.put('/api/proyectos/:id/facturas/:facturaId/modo-abono', async (req, res) => {
+    try {
+        const { modoAbono } = req.body;
+        if (typeof modoAbono !== 'boolean') {
+            return res.status(400).json({ error: 'El estado modoAbono debe ser verdadero o falso.' });
+        }
+
+        const proyecto = await CRMProyecto.findById(req.params.id);
+        if (!proyecto) return res.status(404).json({ error: 'Proyecto no encontrado' });
+        const factura = proyecto.facturas.id(req.params.facturaId);
+        if (!factura) return res.status(404).json({ error: 'Factura no encontrada' });
+
+        factura.modoAbono = modoAbono;
+        await proyecto.save();
+        res.json({ success: true, factura, validacion: await obtenerValidacionCierre(proyecto) });
+    } catch (err) {
+        console.error('Error actualizando modo abono de factura:', err);
+        res.status(500).json({ error: 'No se pudo actualizar el modo abono de la factura.' });
+    }
+});
 // Eliminar una factura de un proyecto
 app.delete('/api/proyectos/:id/facturas/:facturaId', async (req, res) => {
     try {
