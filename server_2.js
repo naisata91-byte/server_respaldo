@@ -1665,7 +1665,22 @@ app.put('/api/cotizaciones/:id/estado', async (req, res) => {
 app.get('/api/proyectos', async (req, res) => {
     try {
         const proys = await CRMProyecto.find().sort({ fechaInicio: -1 });
-        res.json(proys);
+        // Enriquecer cada proyecto con el total y folio de su cotización vinculada
+        const proyEnriquecidos = await Promise.all(proys.map(async p => {
+            const obj = p.toObject();
+            if (p.cotizacionId) {
+                try {
+                    const cot = await CRMCotizacion.findById(p.cotizacionId).select('total folio');
+                    obj.totalCotizacion = cot ? Number(cot.total) : null;
+                    obj.folioCotizacion = cot ? cot.folio : null;
+                } catch (_) { obj.totalCotizacion = null; obj.folioCotizacion = null; }
+            } else {
+                obj.totalCotizacion = null;
+                obj.folioCotizacion = null;
+            }
+            return obj;
+        }));
+        res.json(proyEnriquecidos);
     } catch(err) { res.status(500).json({error: err.message}); }
 });
 
