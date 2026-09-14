@@ -246,7 +246,7 @@ app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // MongoDB Connection
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://jairanaisata_db_user:Hola2025@cluster0.bpnkdj6.mongodb.net/naisata_db?appName=Cluster0';
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://jarvis:Hola2025@cluster0.jih3lub.mongodb.net/naisata_db?appName=Cluster0';
 
 mongoose.connect(MONGODB_URI, {
     serverSelectionTimeoutMS: 30000,
@@ -473,6 +473,7 @@ const CRMProyectoSchema = new mongoose.Schema({
         folio: String,
         descripcion: String,
         monto: Number,
+        abono: { type: Number, default: 0 },
         tipo: { type: String, enum: ['Ingreso', 'Egreso'] },
         pagada: { type: Boolean, default: false },
         archivoUrl: String, // PDF o Imagen
@@ -1960,6 +1961,35 @@ app.put('/api/proyectos/:id/facturas/:facturaId/pagada', async (req, res) => {
     } catch (err) {
         console.error('Error actualizando pago de factura:', err);
         res.status(500).json({ error: 'No se pudo actualizar el pago de la factura.' });
+    }
+});
+
+// Registrar un pago parcial (abono) a una factura
+app.put('/api/proyectos/:id/facturas/:facturaId/abono', async (req, res) => {
+    try {
+        const { abono } = req.body;
+        if (abono === undefined || isNaN(abono)) {
+            return res.status(400).json({ error: 'El monto del abono no es válido.' });
+        }
+
+        const proyecto = await CRMProyecto.findById(req.params.id);
+        if (!proyecto) return res.status(404).json({ error: 'Proyecto no encontrado' });
+        const factura = proyecto.facturas.id(req.params.facturaId);
+        if (!factura) return res.status(404).json({ error: 'Factura no encontrada' });
+
+        factura.abono = Number(abono);
+        // Si el abono cubre el total o más, se marca como pagada
+        if (factura.abono >= factura.monto) {
+            factura.pagada = true;
+        } else {
+            factura.pagada = false;
+        }
+
+        await proyecto.save();
+        res.json({ success: true, factura, validacion: await obtenerValidacionCierre(proyecto) });
+    } catch (err) {
+        console.error('Error registrando abono en factura:', err);
+        res.status(500).json({ error: 'No se pudo registrar el abono.' });
     }
 });
 
