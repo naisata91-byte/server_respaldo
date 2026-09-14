@@ -1742,8 +1742,9 @@ async function obtenerValidacionCierre(proyecto) {
 
     const facturas = proyecto.facturas || [];
     const totalFacturado = facturas.reduce((total, factura) => total + (Number(factura.monto) || 0), 0);
-    const totalCotizacion = cotizacion && Number.isFinite(Number(cotizacion.total)) ? Number(cotizacion.total) : null;
-    const facturacionCompleta = totalCotizacion === null || Math.abs(totalFacturado - totalCotizacion) <= 1;
+    const totalCotizacionSinIva = cotizacion && Number.isFinite(Number(cotizacion.total)) ? Number(cotizacion.total) : null;
+    const totalCotizacionConIva = totalCotizacionSinIva !== null ? totalCotizacionSinIva * 1.16 : null;
+    const facturacionCompleta = totalCotizacionConIva === null || Math.abs(totalFacturado - totalCotizacionConIva) <= 1;
     // Facturas existentes de antes de esta mejora no tienen el campo pagada y
     // por seguridad quedan como pendientes hasta que alguien las confirme.
     const todasFacturasPagadas = facturas.every(factura => factura.pagada === true);
