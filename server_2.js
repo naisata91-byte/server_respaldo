@@ -1407,13 +1407,24 @@ app.post('/api/cotizaciones', async (req, res) => {
 // propias rutas para que nunca se pisen entre usuarios.
 app.patch('/api/cotizaciones/:id/campos', async (req, res) => {
     try {
-        const permitidos = ['clienteId', 'clienteNombre', 'descripcion', 'lugarEjecucion', 'contacto', 'categoria', 'condiciones', 'notas', 'estado', 'fechaSeguimiento', 'requiereRevision', 'esBorrador'];
+        const permitidos = ['clienteId', 'clienteNombre', 'descripcion', 'lugarEjecucion', 'contacto', 'categoria', 'condiciones', 'notas', 'estado', 'fechaSeguimiento', 'requiereRevision', 'esBorrador', 'folio'];
         const cambios = {};
         permitidos.forEach(campo => {
             if (Object.prototype.hasOwnProperty.call(req.body || {}, campo)) cambios[campo] = req.body[campo];
         });
         const cot = await CRMCotizacion.findById(req.params.id);
         if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
+        
+        if (cambios.folio && cambios.folio.trim() !== '' && cambios.folio !== cot.folio) {
+            const existe = await CRMCotizacion.findOne({ folio: cambios.folio.trim() });
+            if (existe && String(existe._id) !== String(cot._id)) {
+                return res.status(409).json({ error: `El folio "${cambios.folio.trim()}" ya está en uso. Por favor, elige otro.` });
+            }
+            cambios.folio = cambios.folio.trim();
+        } else if (Object.prototype.hasOwnProperty.call(cambios, 'folio') && (!cambios.folio || cambios.folio.trim() === '')) {
+            delete cambios.folio; // Si viene vacío, no reemplazamos el folio existente (normalmente autogenerado o previo).
+        }
+
         let clienteResultado = null;
         // Esta marca solo llega desde el botón Guardar al confirmar el
         // borrador. Los autosaves de texto no dan de alta clientes todavía.
