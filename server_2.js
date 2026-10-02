@@ -455,6 +455,45 @@ function lineaBloqueadaPorOtraSesion(req, cotizacionId, coleccion, lineaId) {
     return bloqueo && bloqueo.clientId && bloqueo.clientId !== clientId ? bloqueo : null;
 }
 
+// Avisa a TODOS los clientes (lista/tablero) que cambió el monto de una cotización.
+// Los eventos de renglón solo llegan a quien tiene abierta la cotización; sin
+// este aviso global las demás pantallas se quedaban con el total anterior (0).
+// Los borradores no se anuncian: nadie más debe verlos hasta que se confirmen.
+function emitirTotalesCotizacion(cot) {
+    try {
+        if (!global.io || !cot || cot.esBorrador) return;
+        global.io.emit('cotizacion_totales', { _id: String(cot._id), total: cot.total, subtotal: cot.subtotal, revision: cot.revision });
+    } catch (_) {}
+}
+
+// Elimina un borrador (solo si sigue siendo borrador) y libera sus bloqueos.
+async function descartarBorradorCotizacion(id) {
+    const r = await CRMCotizacion.deleteOne({ _id: id, esBorrador: true });
+    if (r.deletedCount) {
+        for (const [key, b] of bloqueosCotizacion.entries()) if (b.cotizacionId === String(id)) bloqueosCotizacion.delete(key);
+    }
+    return r.deletedCount > 0;
+}
+// Limpieza de borradores abandonados (navegador cerrado, caída de red, etc.)
+setInterval(async () => {
+    try {
+        if (mongoose.connection.readyState !== 1) return;
+        const limite = new Date(Date.now() - 6 * 60 * 60 * 1000);
+        const r = await CRMCotizacion.deleteMany({ esBorrador: true, $or: [{ colaboracionActualizadaEn: { $lt: limite } }, { colaboracionActualizadaEn: { $exists: false }, fechaCreacion: { $lt: limite } }] });
+        if (r.deletedCount) console.log(`🧹 ${r.deletedCount} borrador(es) de cotización abandonados eliminados.`);
+    } catch (e) { console.error('Error limpiando borradores:', e.message); }
+}, 30 * 60 * 1000);
+
+// Genera un folio automático libre (con reintentos ante concurrencia)
+async function generarFolioAutomatico() {
+    let folio;
+    for (let i = 0; i < 5; i++) {
+        folio = `C${await getNextFolioNumber()}`;
+        if (!(await CRMCotizacion.findOne({ folio }))) break;
+    }
+    return folio;
+}
+
 const CRMProyectoSchema = new mongoose.Schema({
     _id: { type: String, default: () => new mongoose.Types.ObjectId().toString() },
     cotizacionId: String, // Referencia a la cotización original
@@ -1296,7 +1335,7 @@ app.post('/api/finanzas/config-empleados/:id', async (req, res) => {
 // Rutas de Cotizaciones
 app.get('/api/cotizaciones', async (req, res) => {
     try {
-        const cots = await CRMCotizacion.find().sort({ fechaCreacion: -1 });
+        const cots = await CRMCotizacion.find({ esBorrador: { $ne: true } }).sort({ fechaCreacion: -1 });
         res.json(cots);
     } catch(err) { res.status(500).json({error: err.message}); }
 });
@@ -1304,7 +1343,7 @@ app.get('/api/cotizaciones', async (req, res) => {
 app.get('/api/cotizaciones/activas', async (req, res) => {
     try {
         const cots = await CRMCotizacion.find(
-            { estado: { $nin: ['Perdido', 'Perdida', 'Rechazado', 'Cerrada', 'Terminada'] } },
+            { estado: { $nin: ['Perdido', 'Perdida', 'Rechazado', 'Cerrada', 'Terminada'] }, esBorrador: { $ne: true } },
             'folio descripcion clienteNombre estado'
         ).sort({ fechaCreacion: -1 });
         res.json(cots);
@@ -1315,6 +1354,7 @@ app.get('/api/cotizaciones/activas', async (req, res) => {
 app.post('/api/cotizaciones/asignar-folios-todos', async (req, res) => {
     try {
         const sinFolio = await CRMCotizacion.find({
+            esBorrador: { $ne: true },
             $or: [
                 { folio: { $exists: false } },
                 { folio: null },
@@ -1365,34 +1405,28 @@ app.post('/api/cotizaciones', async (req, res) => {
         // cotización.
         const clienteResultado = data.esBorrador === true ? null : await asegurarClienteCotizacion(data);
 
-        // Generar folio único — si hay colisión por concurrencia, reintentamos
-        const folioManual = data.folio && data.folio.trim() !== '' && data.folio !== 'Sin folio' && data.folio !== 'Asignación Automática';
-
-        if (folioManual) {
-            // Folio proporcionado manualmente: verificar que no esté en uso
-            const existe = await CRMCotizacion.findOne({ folio: data.folio.trim() });
-            if (existe) {
-                return res.status(409).json({ error: `El folio "${data.folio.trim()}" ya está en uso. Se asignará uno automáticamente.` });
-            }
-            data.folio = data.folio.trim();
+        // Un BORRADOR no consume folio: el folio (manual o automático) se asigna
+        // hasta que se confirma con Guardar. Así cancelar no deja cotizaciones
+        // fantasma ni huecos en la numeración.
+        if (data.esBorrador === true) {
+            delete data.folio;
         } else {
-            // Folio automático con protección ante colisión por concurrencia
-            let intentos = 0;
-            let folioGenerado;
-            while (intentos < 5) {
-                const num = await getNextFolioNumber();
-                folioGenerado = `C${num}`;
-                const existe = await CRMCotizacion.findOne({ folio: folioGenerado });
-                if (!existe) break; // folio disponible
-                intentos++;
+            const folioManual = data.folio && data.folio.trim() !== '' && data.folio !== 'Sin folio' && data.folio !== 'Asignación Automática';
+            if (folioManual) {
+                const existe = await CRMCotizacion.findOne({ folio: data.folio.trim() });
+                if (existe) {
+                    return res.status(409).json({ error: `El folio "${data.folio.trim()}" ya está en uso. Elige otro o usa asignación automática.` });
+                }
+                data.folio = data.folio.trim();
+            } else {
+                data.folio = await generarFolioAutomatico();
             }
-            data.folio = folioGenerado;
         }
 
         const newCotizacion = new CRMCotizacion({ ...data, revision: 1, colaboracionActualizadaEn: new Date() });
         recalcularCotizacion(newCotizacion);
         await newCotizacion.save();
-        try { if (global.io) global.io.emit('cotizacion_creada', newCotizacion); } catch(_) {}
+        if (!newCotizacion.esBorrador) { try { if (global.io) global.io.emit('cotizacion_creada', newCotizacion); } catch(_) {} }
         res.json({ message: 'Cotización creada con éxito', data: newCotizacion, cliente: clienteResultado?.cliente || null, clienteCreado: Boolean(clienteResultado?.creado) });
     } catch(err) {
         if (err.code === 11000) {
@@ -1407,7 +1441,7 @@ app.post('/api/cotizaciones', async (req, res) => {
 // propias rutas para que nunca se pisen entre usuarios.
 app.patch('/api/cotizaciones/:id/campos', async (req, res) => {
     try {
-        const permitidos = ['clienteId', 'clienteNombre', 'descripcion', 'lugarEjecucion', 'contacto', 'categoria', 'condiciones', 'notas', 'estado', 'fechaSeguimiento', 'requiereRevision', 'esBorrador', 'folio'];
+        const permitidos = ['clienteId', 'clienteNombre', 'descripcion', 'lugarEjecucion', 'contacto', 'categoria', 'condiciones', 'notas', 'estado', 'fechaSeguimiento', 'requiereRevision', 'esBorrador', 'folio', 'archivos'];
         const cambios = {};
         permitidos.forEach(campo => {
             if (Object.prototype.hasOwnProperty.call(req.body || {}, campo)) cambios[campo] = req.body[campo];
@@ -1415,6 +1449,8 @@ app.patch('/api/cotizaciones/:id/campos', async (req, res) => {
         const cot = await CRMCotizacion.findById(req.params.id);
         if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
         
+        const eraBorrador = cot.esBorrador === true;
+        if (typeof cambios.folio === 'string' && ['Asignación Automática', 'Sin folio', 'Personalizado'].includes(cambios.folio.trim())) delete cambios.folio;
         if (cambios.folio && cambios.folio.trim() !== '' && cambios.folio !== cot.folio) {
             const existe = await CRMCotizacion.findOne({ folio: cambios.folio.trim() });
             if (existe && String(existe._id) !== String(cot._id)) {
@@ -1434,10 +1470,23 @@ app.patch('/api/cotizaciones/:id/campos', async (req, res) => {
             cambios.clienteId = candidato.clienteId || '';
             cambios.clienteNombre = candidato.clienteNombre || '';
         }
+        // Al confirmar un borrador: folio automático si no eligieron uno manual.
+        if (eraBorrador && cambios.esBorrador === false && !cambios.folio && !cot.folio) {
+            cambios.folio = await generarFolioAutomatico();
+        }
         Object.assign(cot, cambios);
+        if (eraBorrador && cambios.esBorrador === false) recalcularCotizacion(cot);
         cot.revision = valorNumero(cot.revision) + 1;
         cot.colaboracionActualizadaEn = new Date();
         await cot.save();
+        // Aviso global: confirmar un borrador = "cotización creada"; el resto = actualizada.
+        // (Los autosaves de un borrador no se anuncian.)
+        try {
+            if (global.io) {
+                if (eraBorrador && cot.esBorrador === false) global.io.emit('cotizacion_creada', cot);
+                else if (!cot.esBorrador) global.io.emit('cotizacion_actualizada', cot);
+            }
+        } catch (_) {}
         const evento = { tipo: 'campos', cotizacionId: String(cot._id), cambios, revision: cot.revision, actorId: actorCotizacion(req), clientId: clientCotizacion(req) };
         emitirColaboracion(String(cot._id), evento);
         res.json({ data: cot, revision: cot.revision, cliente: clienteResultado?.cliente || null, clienteCreado: Boolean(clienteResultado?.creado) });
@@ -1460,6 +1509,7 @@ function crearRutasLineasCotizacion(tipo, campo) {
             const saved = cot[campo].find(item => item.lineaId === linea.lineaId);
             const evento = { tipo: 'crear_linea', coleccion: campo, cotizacionId: String(cot._id), linea: saved?.toObject?.() || saved, revision: cot.revision, actorId: actor, clientId: clientCotizacion(req) };
             emitirColaboracion(String(cot._id), evento);
+            emitirTotalesCotizacion(cot);
             res.status(201).json({ linea: evento.linea, revision: cot.revision });
         } catch (err) { res.status(400).json({ error: err.message }); }
     });
@@ -1486,6 +1536,7 @@ function crearRutasLineasCotizacion(tipo, campo) {
             await cot.save();
             const evento = { tipo: 'actualizar_linea', coleccion: campo, cotizacionId: String(cot._id), linea: linea.toObject?.() || linea, revision: cot.revision, actorId: actor, clientId: clientCotizacion(req) };
             emitirColaboracion(String(cot._id), evento);
+            emitirTotalesCotizacion(cot);
             res.json({ linea: evento.linea, revision: cot.revision });
         } catch (err) { res.status(400).json({ error: err.message }); }
     });
@@ -1506,12 +1557,25 @@ function crearRutasLineasCotizacion(tipo, campo) {
             await cot.save();
             const evento = { tipo: 'eliminar_linea', coleccion: campo, cotizacionId: String(cot._id), lineaId: req.params.lineaId, revision: cot.revision, actorId: actorCotizacion(req), clientId: clientCotizacion(req) };
             emitirColaboracion(String(cot._id), evento);
+            emitirTotalesCotizacion(cot);
             res.json({ success: true, revision: cot.revision });
         } catch (err) { res.status(400).json({ error: err.message }); }
     });
 }
 crearRutasLineasCotizacion('partidas', 'partidas');
 crearRutasLineasCotizacion('productos-sugeridos', 'productosSugeridos');
+
+// Descarta un borrador (Cancelar / cerrar el modal). Solo borra si sigue siendo
+// borrador: una cotización ya confirmada nunca se elimina por esta ruta.
+// La variante POST existe para navigator.sendBeacon al cerrar la pestaña.
+app.delete('/api/cotizaciones/:id/borrador', async (req, res) => {
+    try { res.json({ eliminado: await descartarBorradorCotizacion(req.params.id) }); }
+    catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post('/api/cotizaciones/:id/descartar-borrador', async (req, res) => {
+    try { res.json({ eliminado: await descartarBorradorCotizacion(req.params.id) }); }
+    catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 app.put('/api/cotizaciones/:id', async (req, res) => {
     try {
@@ -1531,6 +1595,10 @@ app.put('/api/cotizaciones/:id', async (req, res) => {
                 return payloadLinea(campo, linea, actorCotizacion(req), previa);
             });
         });
+        if (Array.isArray(data.partidas)) {
+            const sub = data.partidas.reduce((sum, p) => sum + valorNumero(p.total), 0);
+            data.subtotal = sub; data.total = sub;
+        }
         data.revision = valorNumero(anterior.revision) + 1;
         data.colaboracionActualizadaEn = new Date();
         
@@ -3741,7 +3809,7 @@ app.get('/api/clientes/mis-cotizaciones', authCliente, async (req, res) => {
             };
         }
 
-        const cotizaciones = await CRMCotizacion.find(query)
+        const cotizaciones = await CRMCotizacion.find({ ...query, esBorrador: { $ne: true } })
             .select('folio clienteNombre descripcion total estado fechaCreacion')
             .sort({ fechaCreacion: -1 });
 
