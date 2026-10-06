@@ -31,15 +31,27 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
         eliminadoPor: String, eliminadoPorNombre: String, eliminadoLote: String, eliminadoRaiz: Boolean
     }, { timestamps: { createdAt: 'creado', updatedAt: 'modificado' } });
     const Nodo = mongoose.models.CRMNodo || mongoose.model('CRMNodo', NodoSchema);
+    const Notificacion = mongoose.models.CRMNotificacion || mongoose.model('CRMNotificacion', new mongoose.Schema({
+        usuarioId: { type: String, required: true, index: true },
+        tipo: { type: String, default: 'archivo' },
+        titulo: String, mensaje: String, itemId: String, vista: String,
+        leida: { type: Boolean, default: false, index: true }
+    }, { timestamps: { createdAt: 'creado', updatedAt: false } }));
 
     // ---------- Identidad y permisos ----------
     const auth = (req, res, next) => {
         const id = String(req.get('x-user-id') || req.query.uid || '').trim();
-        if (!id) return res.status(401).json({ error: 'Usuario no identificado. Inicia sesión de nuevo.' });
-        let nombre = '';
-        try { nombre = decodeURIComponent(req.get('x-user-name') || ''); } catch (_) { /* cabecera mal codificada */ }
-        req.u = { id, nombre };
-        next();
+        const token = String(req.get('x-crm-session') || req.query.st || '').trim();
+        if (!id || !token) return res.status(401).json({ error: 'Sesión no válida. Inicia sesión de nuevo.' });
+        const Usuarios = mongoose.models.UserRef;
+        if (!Usuarios) return res.status(503).json({ error: 'El directorio de usuarios aún no está disponible.' });
+        Usuarios.findOne({ _id: id, tokenCrm: token }).select('_id nombre apellido correo').lean()
+            .then(usuario => {
+                if (!usuario) return res.status(401).json({ error: 'Sesión no válida. Inicia sesión de nuevo.' });
+                req.u = { id: String(usuario._id), nombre: `${usuario.nombre || ''} ${usuario.apellido || ''}`.trim() || usuario.correo || 'Alguien' };
+                next();
+            })
+            .catch(() => res.status(503).json({ error: 'No se pudo validar la sesión.' }));
     };
     const puedeLeer = (n, u) => n.propietarioId === u || n.visibilidad === 'publica' || (n.compartidoCon || []).some(c => c.userId === u);
     const puedeEditar = (n, u) => n.propietarioId === u || (n.compartidoCon || []).some(c => c.userId === u && c.permiso === 'edicion');
@@ -54,8 +66,53 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
         compartidoCon: n.propietarioId === u ? (n.compartidoCon || []) : undefined,
         permiso: n.propietarioId === u ? 'propietario' : ((n.compartidoCon || []).find(c => c.userId === u) || {}).permiso || (n.visibilidad === 'publica' ? 'lectura' : '')
     });
-    // Tiempo real: aviso ligero (sin datos) para que los clientes refresquen su lista
-    const avisar = (req, extra = {}) => { try { global.io?.emit('archivos_crm_cambio', { actor: req.u.id, ...extra }); } catch (_) {} };
+    // Tiempo real y bandeja persistente. El evento se entrega únicamente al
+    // propietario, colaboradores y, si es público, al grupo completo.
+    async function destinatariosDe(nodos) {
+        const ids = new Set(); let publico = false;
+        for (const nodo of (Array.isArray(nodos) ? nodos : [nodos])) {
+            if (!nodo) continue;
+            if (nodo.propietarioId) ids.add(String(nodo.propietarioId));
+            for (const c of nodo.compartidoCon || []) if (c.userId) ids.add(String(c.userId));
+            publico ||= nodo.visibilidad === 'publica';
+        }
+        if (publico) {
+            const Usuarios = mongoose.models.UserRef;
+            if (Usuarios) for (const u of await Usuarios.find().select('_id').lean()) ids.add(String(u._id));
+        }
+        return [...ids];
+    }
+    async function avisar(req, objetivo, extra = {}) {
+        const nodos = Array.isArray(objetivo) ? objetivo : [objetivo];
+        const principal = nodos.find(Boolean);
+        if (!principal) return;
+        const destinatarios = await destinatariosDe(nodos);
+        const tipo = extra.tipo || 'actualizado';
+        const nombre = extra.nombre || principal.nombre || 'un archivo';
+        const autor = req.u.nombre || 'Alguien';
+        const titulo = tipo === 'compartido' ? 'Nuevo archivo compartido' : 'Actualización de archivos';
+        const acciones = {
+            carpeta_creada: 'creó la carpeta', archivos_subidos: 'subió archivos en', actualizado: 'actualizó',
+            eliminado: 'eliminó', restaurado: 'restauró', movido: 'movió', copiado: 'copió',
+            hoja_actualizada: 'actualizó la hoja', compartido: 'compartió contigo'
+        };
+        const mensaje = extra.mensaje || `${autor} ${acciones[tipo] || 'actualizó'} “${nombre}”.`;
+        const evento = { actor: req.u.id, tipo, nombre, itemId: String(principal._id), vista: 'archivos', hoja: extra.hoja, mensaje, creadoEn: new Date().toISOString() };
+        const receptores = destinatarios.filter(id => id !== String(req.u.id));
+        try { global.emitirAUsuariosCrm?.(receptores, evento); } catch (_) {}
+        if (receptores.length) await Notificacion.insertMany(receptores.map(usuarioId => ({ usuarioId, tipo, titulo, mensaje, itemId: evento.itemId, vista: 'archivos' }))).catch(() => {});
+    }
+    // Disponible para adjuntos de cotizaciones/proyectos: son visibles para el
+    // grupo operativo y por ello reciben el mismo historial de avisos.
+    global.notificarGrupoArchivosCrm = async ({ actorId = '', actorNombre = 'Alguien', tipo = 'actualizado', nombre = 'un documento', vista = 'proyectos' } = {}) => {
+        const Usuarios = mongoose.models.UserRef;
+        if (!Usuarios) return;
+        const ids = (await Usuarios.find().select('_id').lean()).map(u => String(u._id)).filter(id => id !== String(actorId));
+        const mensaje = `${actorNombre} ${tipo === 'eliminado' ? 'eliminó' : 'subió'} “${nombre}”.`;
+        const evento = { actor: String(actorId), tipo, nombre, vista, mensaje, creadoEn: new Date().toISOString() };
+        try { global.emitirAUsuariosCrm?.(ids, evento); } catch (_) {}
+        if (ids.length) await Notificacion.insertMany(ids.map(usuarioId => ({ usuarioId, tipo, titulo: 'Actualización de documentos', mensaje, vista }))).catch(() => {});
+    };
     const err = (res, e) => res.status(500).json({ error: e.message });
 
     const vivo = { eliminadoEn: null };   // filtro: excluye lo que está en la papelera
@@ -82,6 +139,18 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
 
     // Fase 4: auditoría, cuota/tipos bloqueados y ZIP de carpeta (se registra antes de las rutas para auditarlas todas)
     const fase4 = require('./archivos-fase4-routes')({ app, mongoose, getNodo: () => Nodo, CRMArchivo, auth, puedeLeer, vivo, err });
+
+    app.get('/api/archivos-crm/notificaciones', auth, async (req, res) => {
+        try {
+            const limite = Math.min(Math.max(Number(req.query.limite) || 30, 1), 100);
+            const items = await Notificacion.find({ usuarioId: req.u.id }).sort({ creado: -1 }).limit(limite).lean();
+            const noLeidas = await Notificacion.countDocuments({ usuarioId: req.u.id, leida: false });
+            res.json({ items, noLeidas });
+        } catch (e) { err(res, e); }
+    });
+    app.put('/api/archivos-crm/notificaciones/leidas', auth, async (req, res) => {
+        try { await Notificacion.updateMany({ usuarioId: req.u.id, leida: false }, { $set: { leida: true } }); res.json({ ok: true }); } catch (e) { err(res, e); }
+    });
 
     // ---------- Listar ----------
     // vista: mios | equipo (publicado por otros) | publicados (publicado por mí)
@@ -134,7 +203,7 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
                 visibilidad: padre ? padre.visibilidad : 'privada',
                 compartidoCon: padre ? padre.compartidoCon : []
             });
-            avisar(req);
+            await avisar(req, nodo, { tipo: 'carpeta_creada' });
             res.json(dto(nodo, req.u.id));
         } catch (e) { err(res, e); }
     });
@@ -159,7 +228,7 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
             const propietarioNombre = padre ? padre.propietarioNombre : req.u.nombre;
             const motivo = await fase4.validarSubida(propietarioId, req.files);
             if (motivo) return res.status(400).json({ error: motivo });
-            const creados = [];
+            const creados = [], nodosCreados = [];
             for (const f of req.files || []) {
                 const original = Buffer.from(f.originalname, 'latin1').toString('utf8');   // corrige acentos
                 const contenido = await CRMArchivo.create({
@@ -171,10 +240,33 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
                     visibilidad: padre ? padre.visibilidad : 'privada', compartidoCon: padre ? padre.compartidoCon : [],
                     archivoId: String(contenido._id), contentType: f.mimetype, tamanio: f.size
                 });
+                nodosCreados.push(nodo);
                 creados.push(dto(nodo, req.u.id));
             }
-            avisar(req);
+            await avisar(req, nodosCreados, { tipo: 'archivos_subidos', nombre: creados.length === 1 ? creados[0].nombre : `${creados.length} archivos` });
             res.json({ items: creados });
+        } catch (e) { err(res, e); }
+    });
+
+    // ---------- Reemplazar el contenido de un archivo existente ----------
+    app.put('/api/archivos-crm/:id/contenido', auth, subirMw, async (req, res) => {
+        try {
+            const nodo = await Nodo.findById(req.params.id);
+            if (!nodo || nodo.tipo !== 'archivo' || nodo.eliminadoEn) return res.status(404).json({ error: 'No encontrado' });
+            if (!puedeEditar(nodo, req.u.id)) return res.status(403).json({ error: 'No tienes permiso para modificarlo' });
+            const f = req.files && req.files[0];
+            if (!f) return res.status(400).json({ error: 'Falta archivo' });
+            await CRMArchivo.findByIdAndUpdate(nodo.archivoId, {
+                contentType: f.mimetype,
+                datos: f.buffer.toString('base64'),
+                tamanio: f.size
+            });
+            nodo.tamanio = f.size;
+            nodo.modificado = new Date();
+            nodo.modificadoPorNombre = req.u.nombre;
+            await nodo.save();
+            await avisar(req, nodo, { tipo: 'actualizado' });
+            res.json(dto(nodo, req.u.id));
         } catch (e) { err(res, e); }
     });
 
@@ -203,7 +295,7 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
                 }
             }
             await nodo.save();
-            avisar(req);
+            await avisar(req, nodo, { tipo: 'actualizado' });
             res.json(dto(nodo, req.u.id));
         } catch (e) { err(res, e); }
     });
@@ -218,7 +310,7 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
             const ids = [nodo._id, ...(await descendientes(nodo._id)).map(d => d._id)];
             await Nodo.updateMany({ _id: { $in: ids } }, { $set: { eliminadoEn: ahora, eliminadoLote: lote, eliminadoPor: req.u.id, eliminadoPorNombre: req.u.nombre, eliminadoRaiz: false } });
             await Nodo.updateOne({ _id: nodo._id }, { $set: { eliminadoRaiz: true } });
-            avisar(req);
+            await avisar(req, nodo, { tipo: 'eliminado' });
             res.json({ ok: true, eliminados: ids.length, enPapelera: true });
         } catch (e) { err(res, e); }
     });
@@ -277,7 +369,7 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
             nodo.eliminadoEn = null; nodo.eliminadoRaiz = false;
             nodo.eliminadoLote = undefined; nodo.eliminadoPor = undefined; nodo.eliminadoPorNombre = undefined;
             await nodo.save();
-            avisar(req);
+            await avisar(req, nodo, { tipo: 'restaurado' });
             res.json({ ok: true, item: dto(nodo, req.u.id), enRaiz: !padre });
         } catch (e) { err(res, e); }
     });
@@ -288,7 +380,7 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
             const nodo = await Nodo.findById(req.params.id);
             if (!nodo || !nodo.eliminadoEn || !nodo.eliminadoRaiz || !puedeVerPapelera(nodo, req.u.id)) return res.status(404).json({ error: 'No está en la papelera' });
             const n = await borrarDefinitivo(nodo);
-            avisar(req);
+            await avisar(req, nodo, { tipo: 'eliminado' });
             res.json({ ok: true, eliminados: n });
         } catch (e) { err(res, e); }
     });
@@ -325,7 +417,7 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
             if (ids.length) await Nodo.updateMany({ _id: { $in: ids } }, { $set: { compartidoCon: lista, visibilidad } });
             await nodo.save();
             const nuevos = lista.map(c => c.userId).filter(id => !antes.has(id));
-            avisar(req, { compartidoA: nuevos, por: req.u.nombre, nombre: nodo.nombre });
+            await avisar(req, nodo, { tipo: 'compartido', nombre: nodo.nombre, mensaje: `${req.u.nombre || 'Alguien'} compartió contigo “${nodo.nombre}”.` });
             res.json(dto(nodo, req.u.id));
         } catch (e) { err(res, e); }
     });
@@ -363,7 +455,7 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
                 if (ids.length) await Nodo.updateMany({ _id: { $in: ids } }, { $set: { visibilidad: nodo.visibilidad, compartidoCon: nodo.compartidoCon } });
             }
             await nodo.save();
-            avisar(req);
+            await avisar(req, nodo, { tipo: 'movido' });
             res.json(dto(nodo, u));
         } catch (e) { err(res, e); }
     });
@@ -401,7 +493,7 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
                 return creado;
             }
             const raiz = await clonar(origen, destinoId);
-            avisar(req);
+            await avisar(req, raiz, { tipo: 'copiado' });
             res.json({ ok: true, copiados: total, item: raiz ? dto(raiz, u) : null });
         } catch (e) { err(res, e); }
     });
