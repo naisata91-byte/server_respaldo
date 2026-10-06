@@ -254,7 +254,13 @@ app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // MongoDB Connection
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://jairanaisata_db_user:Hola2025@cluster0.bpnkdj6.mongodb.net/naisata_db?appName=Cluster0';
+const MONGODB_URI = process.env.MONGODB_URI;
+if (!MONGODB_URI) {
+    console.error('\n[ERROR] Falta la variable de entorno MONGODB_URI.');
+    console.error('        Defínela en el servidor (p. ej. en Render/Railway > Environment, o en PowerShell: $env:MONGODB_URI="mongodb+srv://usuario:clave@cluster/naisata_db").');
+    console.error('        La contraseña ya no se guarda en el código por seguridad.\n');
+    process.exit(1);
+}
 
 mongoose.connect(MONGODB_URI, {
     serverSelectionTimeoutMS: 30000,
@@ -1097,7 +1103,7 @@ app.get('/api/debug/status', (req, res) => {
         server: 'OK',
         mongodb: estados[dbState] || `estado-${dbState}`,
         mongodbReadyState: dbState,
-        uri_source: process.env.MONGODB_URI ? 'variable de entorno' : 'hardcoded',
+        uri_source: 'variable de entorno',
         timestamp: new Date().toISOString()
     });
 });
