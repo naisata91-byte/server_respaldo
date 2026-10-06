@@ -552,6 +552,9 @@ const CRMArchivoSchema = new mongoose.Schema({
 });
 const CRMArchivo = mongoose.model('CRMArchivo', CRMArchivoSchema);
 
+// Módulo Archivos del CRM (carpetas, privado/publicado) — ver archivos-routes.js
+require('./archivos-routes')({ app, mongoose, upload, CRMArchivo });
+
 const CRMActividadSchema = new mongoose.Schema({
     _id: { type: String, default: () => new mongoose.Types.ObjectId().toString() },
     descripcion: String,
