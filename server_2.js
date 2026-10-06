@@ -177,6 +177,15 @@ const io = new Server(server, {
 });
 global.io = io; // Expose io globally to routes
 
+// Los cambios dirigidos (por ejemplo, archivos compartidos) no deben viajar a
+// todos los navegadores conectados. Cada sesión se registra en una sala propia
+// y las rutas emiten solamente a las personas que sí tienen acceso.
+const salaUsuarioCrm = id => `usuario:${String(id || '').trim()}`;
+global.emitirAUsuariosCrm = (ids, evento) => {
+    const destinatarios = [...new Set((ids || []).map(String).filter(Boolean))];
+    for (const id of destinatarios) io.to(salaUsuarioCrm(id)).emit('archivos_crm_cambio', evento);
+};
+
 // Render exige que el puerto se abra pronto. Se abre aquí (antes de cargar el resto)
 // para que un error posterior no deje el servicio sin puerto. Las rutas se agregan después sin problema.
 server.listen(PORT, '0.0.0.0', () => {
@@ -205,6 +214,17 @@ function liberarBloqueosSocket(socketId, soloCotizacionId = '') {
 }
 
 io.on('connection', socket => {
+    socket.on('crm:identificar', async data => {
+        const userId = String(data?.userId || '').trim();
+        const token = String(data?.token || '').trim();
+        if (!userId || !token || userId.length > 100) return;
+        const Usuarios = mongoose.models.UserRef;
+        const usuario = Usuarios && await Usuarios.findOne({ _id: userId, tokenCrm: token }).select('_id').lean();
+        if (!usuario) return;
+        if (socket.data.crmUserId) socket.leave(salaUsuarioCrm(socket.data.crmUserId));
+        socket.data.crmUserId = userId;
+        socket.join(salaUsuarioCrm(userId));
+    });
     socket.on('cotizacion:unirse', data => {
         const cotizacionId = String(data?.cotizacionId || '').trim();
         if (cotizacionId) {
@@ -302,7 +322,7 @@ const InvItemRefSchema = new mongoose.Schema({
 const UserRefSchema = new mongoose.Schema({
     _id: { type: String, default: () => new mongoose.Types.ObjectId().toString() },
     nombre: String, apellido: String, telefono: String,
-    correo: String, password: String, rol: String, estadoCuenta: String, tokenPortal: String,
+    correo: String, password: String, rol: String, estadoCuenta: String, tokenPortal: String, tokenCrm: String,
     categoria: { type: String, enum: ['Electricidad', 'Voz y Datos', 'Aires Acondicionados', 'Aislamiento', 'Tablaroca'], default: '' },
     sueldoBase: { type: Number, default: 0 },
     permisosCrm: [String],
@@ -561,6 +581,15 @@ const CRMArchivoSchema = new mongoose.Schema({
     fechaSubida: { type: Date, default: Date.now }
 });
 const CRMArchivo = mongoose.model('CRMArchivo', CRMArchivoSchema);
+
+// Compatibilidad con la sesión actual del CRM. Los adjuntos históricos no
+// tenían metadatos propios; usamos estos datos para que sus avisos sí indiquen
+// quién hizo el cambio mientras se termina la migración de permisos.
+function actorArchivoReq(req) {
+    let nombre = '';
+    try { nombre = decodeURIComponent(req.get('x-user-name') || ''); } catch (_) {}
+    return { id: String(req.get('x-user-id') || '').trim(), nombre: nombre || 'Alguien' };
+}
 
 // Módulo Archivos del CRM (carpetas, privado/publicado) — ver archivos-routes.js
 try {
@@ -1725,6 +1754,10 @@ app.post('/api/cotizaciones/:id/archivos', upload.array('archivos', 10), async (
             cot.archivos.push(`/api/archivos/${saved._id}`);
         }
         await cot.save();
+        const actor = actorArchivoReq(req);
+        for (const file of req.files || []) {
+            await global.notificarGrupoArchivosCrm?.({ actorId: actor.id, actorNombre: actor.nombre, tipo: 'archivos_subidos', nombre: file.originalname, vista: 'cotizaciones' });
+        }
         res.json({ archivos: cot.archivos });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -1737,9 +1770,12 @@ app.delete('/api/cotizaciones/:id/archivos/:archivoId', async (req, res) => {
         const { id, archivoId } = req.params;
         const cot = await CRMCotizacion.findById(id);
         if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
+        const archivo = await CRMArchivo.findById(archivoId).select('nombre');
         cot.archivos = (cot.archivos || []).filter(u => !u.includes(archivoId));
         await cot.save();
         await CRMArchivo.findByIdAndDelete(archivoId);
+        const actor = actorArchivoReq(req);
+        await global.notificarGrupoArchivosCrm?.({ actorId: actor.id, actorNombre: actor.nombre, tipo: 'eliminado', nombre: archivo?.nombre || 'un documento', vista: 'cotizaciones' });
         res.json({ archivos: cot.archivos });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -2008,6 +2044,10 @@ app.post('/api/proyectos/:id/archivos', upload.array('archivos', 5), async (req,
             proj.archivos.push(`/api/archivos/${saved._id}`);
         }
         await proj.save();
+        const actor = actorArchivoReq(req);
+        for (const file of req.files || []) {
+            await global.notificarGrupoArchivosCrm?.({ actorId: actor.id, actorNombre: actor.nombre, tipo: 'archivos_subidos', nombre: file.originalname, vista: 'proyectos' });
+        }
         res.json({ files: proj.archivos });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -2051,6 +2091,8 @@ app.post('/api/proyectos/:id/facturas', upload.single('archivo'), async (req, re
         if (!proj.facturas) proj.facturas = [];
         proj.facturas.push({ folio, monto: parseFloat(monto) || 0, archivoUrl, tipo: 'Ingreso', pagada: false, fecha: new Date() });
         await proj.save();
+        const actor = actorArchivoReq(req);
+        await global.notificarGrupoArchivosCrm?.({ actorId: actor.id, actorNombre: actor.nombre, tipo: 'archivos_subidos', nombre: req.file.originalname, vista: 'proyectos' });
         res.json({ success: true, facturas: proj.facturas });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -2212,6 +2254,10 @@ app.post('/api/proyectos/:id/avance', upload.array('fotos', 5), async (req, res)
         }
         
         await proj.save();
+        if (fotosUrls.length) {
+            const actor = actorArchivoReq(req);
+            await global.notificarGrupoArchivosCrm?.({ actorId: actor.id, actorNombre: actor.nombre, tipo: 'archivos_subidos', nombre: `${fotosUrls.length} evidencia(s) de avance`, vista: 'proyectos' });
+        }
         
         res.json({ success: true, avance: proj.avances[proj.avances.length - 1] });
     } catch (err) {
@@ -3563,6 +3609,7 @@ function empleadoPublico(empleado) {
     const data = empleado && typeof empleado.toObject === 'function' ? empleado.toObject() : { ...(empleado || {}) };
     delete data.password;
     delete data.tokenPortal;
+    delete data.tokenCrm;
     data.idTipo = tipoIdUsuario(data._id);
     return data;
 }
@@ -3629,10 +3676,13 @@ app.post('/api/login', async (req, res) => {
             empleado.password = passwordProtegida;
         }
 
+        const token = generateToken();
+        await mongoose.connection.db.collection('users').updateOne({ _id: empleado._id }, { $set: { tokenCrm: token } });
+        empleado.tokenCrm = token;
         // Devolvemos el empleado completo en el objeto "user" como espera el frontend
         return res.json({ 
             message: 'Login exitoso', 
-            user: empleadoPublico(empleado)
+            user: empleadoPublico(empleado), token
         });
 
     } catch (error) {
