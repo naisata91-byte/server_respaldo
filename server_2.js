@@ -553,7 +553,13 @@ const CRMArchivoSchema = new mongoose.Schema({
 const CRMArchivo = mongoose.model('CRMArchivo', CRMArchivoSchema);
 
 // Módulo Archivos del CRM (carpetas, privado/publicado) — ver archivos-routes.js
-require('./archivos-routes')({ app, mongoose, upload, CRMArchivo });
+try {
+    require('./archivos-routes')({ app, mongoose, upload, CRMArchivo });
+} catch (e) {
+    // Si falta o falla el módulo, el servidor NO debe dejar de arrancar (Render necesita abrir el puerto).
+    // console.log/error están redirigidos en este archivo, por eso se escribe directo a stderr.
+    process.stderr.write('[Archivos] Módulo no cargado: ' + (e && e.message) + '\n');
+}
 
 const CRMActividadSchema = new mongoose.Schema({
     _id: { type: String, default: () => new mongoose.Types.ObjectId().toString() },
