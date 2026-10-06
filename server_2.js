@@ -67,6 +67,7 @@ const isPuppeteerNoise = (err) => {
 // Capturar errores no manejados globalmente
 process.on('uncaughtException', async (err) => {
     if (isPuppeteerNoise(err)) return; // ignorar ruido de Puppeteer
+    process.stderr.write('[uncaughtException] ' + (err && err.stack ? err.stack : String(err)) + '\n');
     
     // ENOENT del ZIP = /app era read-only. Ahora usamos /tmp, no debe ocurrir.
     // NO borrar la sesión de MongoDB — puede ser válida y recuperable.
@@ -86,6 +87,7 @@ process.on('uncaughtException', async (err) => {
 });
 process.on('unhandledRejection', (reason) => {
     if (isPuppeteerNoise(reason)) return; // ignorar ruido de Puppeteer
+    process.stderr.write('[unhandledRejection] ' + (reason && reason.stack ? reason.stack : String(reason)) + '\n');
     waLog.addError('unhandledRejection', reason instanceof Error ? reason : new Error(String(reason)));
 });
 
@@ -174,6 +176,12 @@ const io = new Server(server, {
     cors: { origin: '*' }
 });
 global.io = io; // Expose io globally to routes
+
+// Render exige que el puerto se abra pronto. Se abre aquí (antes de cargar el resto)
+// para que un error posterior no deje el servicio sin puerto. Las rutas se agregan después sin problema.
+server.listen(PORT, '0.0.0.0', () => {
+    process.stderr.write('[CRM] Puerto abierto: ' + PORT + '\n');
+});
 
 // Bloqueos efímeros de edición por renglón. No se guardan en MongoDB: se
 // liberan al salir del campo o al desconectarse el navegador.
@@ -4221,6 +4229,5 @@ app.delete('/api/admin/clientes-portal/:clienteId/acceso/:cotizacionId', async (
 });
 
 // Start Server
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Servidor CRM corriendo en http://localhost:${PORT} con WebSocket`);
-});
+// (El puerto ya se abrió al inicio del archivo, junto con el servidor HTTP.)
+process.stderr.write('[CRM] Todas las rutas cargadas correctamente\n');

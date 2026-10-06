@@ -1,5 +1,5 @@
 /* ============================================================================
-   archivos-routes.js — API del módulo "Archivos" del CRM (FASE 1)
+   archivos-routes.js — API del módulo "Archivos" del CRM (FASE 2)
    Se registra desde server_2.js con:
        require('./archivos-routes')({ app, mongoose, upload, CRMArchivo });
    Reutiliza CRMArchivo (contenido en base64) y agrega la colección CRMNodo
@@ -21,6 +21,7 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
         visibilidad: { type: String, enum: ['privada', 'compartida', 'publica'], default: 'privada' },
         // Fase 2: compartir con usuarios específicos. Ya soportado en los permisos de abajo.
         compartidoCon: { type: [{ _id: false, userId: String, nombre: String, permiso: { type: String, default: 'lectura' } }], default: [] },
+        creadoPorNombre: String,
         archivoId: String,      // referencia a CRMArchivo (solo tipo 'archivo')
         contentType: String,
         tamanio: Number
@@ -38,11 +39,19 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
     };
     const puedeLeer = (n, u) => n.propietarioId === u || n.visibilidad === 'publica' || (n.compartidoCon || []).some(c => c.userId === u);
     const puedeEditar = (n, u) => n.propietarioId === u || (n.compartidoCon || []).some(c => c.userId === u && c.permiso === 'edicion');
+    // Quien tiene permiso de edición puede renombrar/eliminar/mover contenido DENTRO de la carpeta compartida,
+    // pero no la carpeta raíz compartida ni cambiar sus permisos (eso es solo del propietario).
+    const puedeModificar = (n, u) => n.propietarioId === u || (!!n.padreId && puedeEditar(n, u));
     const dto = (n, u) => ({
         _id: n._id, tipo: n.tipo, nombre: n.nombre, padreId: n.padreId, visibilidad: n.visibilidad,
         propietarioNombre: n.propietarioNombre, esMio: n.propietarioId === u, editable: puedeEditar(n, u),
-        contentType: n.contentType, tamanio: n.tamanio, creado: n.creado, modificado: n.modificado
+        contentType: n.contentType, tamanio: n.tamanio, creado: n.creado, modificado: n.modificado,
+        modificable: puedeModificar(n, u), creadoPor: n.creadoPorNombre || n.propietarioNombre,
+        compartidoCon: n.propietarioId === u ? (n.compartidoCon || []) : undefined,
+        permiso: n.propietarioId === u ? 'propietario' : ((n.compartidoCon || []).find(c => c.userId === u) || {}).permiso || (n.visibilidad === 'publica' ? 'lectura' : '')
     });
+    // Tiempo real: aviso ligero (sin datos) para que los clientes refresquen su lista
+    const avisar = (req, extra = {}) => { try { global.io?.emit('archivos_crm_cambio', { actor: req.u.id, ...extra }); } catch (_) {} };
     const err = (res, e) => res.status(500).json({ error: e.message });
 
     async function descendientes(id) {
@@ -55,11 +64,11 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
         return out;
     }
     // Evita duplicados en la misma carpeta: "Plano.pdf" -> "Plano (2).pdf"
-    async function nombreLibre(padreId, propietarioId, nombre) {
+    async function nombreLibre(padreId, nombre) {
         const punto = nombre.lastIndexOf('.');
         const [base, ext] = punto > 0 ? [nombre.slice(0, punto), nombre.slice(punto)] : [nombre, ''];
         let candidato = nombre, n = 1;
-        while (await Nodo.exists({ padreId, propietarioId, nombre: candidato })) candidato = `${base} (${++n})${ext}`;
+        while (await Nodo.exists({ padreId, nombre: candidato })) candidato = `${base} (${++n})${ext}`;
         return candidato;
     }
     const nombreValido = n => typeof n === 'string' && n.trim() && n.trim().length <= 120 && !/[\\/:*?"<>|]/.test(n);
@@ -69,14 +78,19 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
     app.get('/api/archivos-crm', auth, async (req, res) => {
         try {
             const u = req.u.id, vista = req.query.vista || 'mios', padreId = req.query.padreId || null;
-            let items = [], ruta = [];
+            let items = [], ruta = [], editable = !padreId && vista === 'mios';
             if (padreId) {
                 const padre = await Nodo.findById(padreId);
                 if (!padre || padre.tipo !== 'carpeta' || !puedeLeer(padre, u)) return res.status(404).json({ error: 'Carpeta no disponible' });
+                editable = puedeEditar(padre, u);
                 items = (await Nodo.find({ padreId })).filter(n => puedeLeer(n, u));
                 for (let c = padre; c && puedeLeer(c, u); c = c.padreId ? await Nodo.findById(c.padreId) : null) ruta.unshift({ _id: c._id, nombre: c.nombre });
             } else if (vista === 'mios') {
                 items = await Nodo.find({ propietarioId: u, padreId: null });
+            } else if (vista === 'conmigo') {
+                const todos = await Nodo.find({ propietarioId: { $ne: u }, 'compartidoCon.userId': u });
+                const ids = new Set(todos.map(n => n._id));
+                items = todos.filter(n => !n.padreId || !ids.has(n.padreId));
             } else {
                 const filtro = vista === 'equipo'
                     ? { visibilidad: 'publica', propietarioId: { $ne: u } }
@@ -86,7 +100,7 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
                 items = todos.filter(n => !n.padreId || !ids.has(n.padreId));   // solo la "raíz" de lo publicado
             }
             items.sort((a, b) => (a.tipo === b.tipo ? a.nombre.localeCompare(b.nombre, 'es', { sensitivity: 'base' }) : a.tipo === 'carpeta' ? -1 : 1));
-            res.json({ items: items.map(n => dto(n, u)), ruta });
+            res.json({ items: items.map(n => dto(n, u)), ruta, editable });
         } catch (e) { err(res, e); }
     });
 
@@ -101,14 +115,16 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
                 if (!padre || padre.tipo !== 'carpeta') return res.status(404).json({ error: 'Carpeta destino no encontrada' });
                 if (!puedeEditar(padre, req.u.id)) return res.status(403).json({ error: 'No tienes permiso en esta carpeta' });
             }
-            if (await Nodo.exists({ padreId: padreId || null, propietarioId: req.u.id, nombre: nombre.trim() }))
+            if (await Nodo.exists({ padreId: padreId || null, nombre: nombre.trim() }))
                 return res.status(409).json({ error: 'Ya existe un elemento con ese nombre aquí' });
             const nodo = await Nodo.create({
                 tipo: 'carpeta', nombre: nombre.trim(), padreId: padreId || null,
-                propietarioId: req.u.id, propietarioNombre: req.u.nombre,
+                propietarioId: padre ? padre.propietarioId : req.u.id, propietarioNombre: padre ? padre.propietarioNombre : req.u.nombre,
+                creadoPorNombre: req.u.nombre,
                 visibilidad: padre ? padre.visibilidad : 'privada',
                 compartidoCon: padre ? padre.compartidoCon : []
             });
+            avisar(req);
             res.json(dto(nodo, req.u.id));
         } catch (e) { err(res, e); }
     });
@@ -133,13 +149,14 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
                     nombre: original, contentType: f.mimetype, datos: f.buffer.toString('base64'), tamanio: f.size
                 });
                 const nodo = await Nodo.create({
-                    tipo: 'archivo', nombre: await nombreLibre(padreId, req.u.id, original), padreId,
+                    tipo: 'archivo', nombre: await nombreLibre(padreId, original), padreId,
                     propietarioId: req.u.id, propietarioNombre: req.u.nombre,
                     visibilidad: padre ? padre.visibilidad : 'privada', compartidoCon: padre ? padre.compartidoCon : [],
                     archivoId: String(contenido._id), contentType: f.mimetype, tamanio: f.size
                 });
                 creados.push(dto(nodo, req.u.id));
             }
+            avisar(req);
             res.json({ items: creados });
         } catch (e) { err(res, e); }
     });
@@ -149,23 +166,27 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
         try {
             const nodo = await Nodo.findById(req.params.id);
             if (!nodo) return res.status(404).json({ error: 'No encontrado' });
-            if (nodo.propietarioId !== req.u.id) return res.status(403).json({ error: 'Solo el propietario puede modificarlo' });
             const { nombre, visibilidad } = req.body || {};
+            if (!puedeModificar(nodo, req.u.id) || (visibilidad !== undefined && nodo.propietarioId !== req.u.id))
+                return res.status(403).json({ error: 'No tienes permiso para modificarlo' });
             if (nombre !== undefined) {
                 if (!nombreValido(nombre)) return res.status(400).json({ error: 'Nombre no válido (no uses \\ / : * ? " < > |)' });
-                const dup = await Nodo.exists({ _id: { $ne: nodo._id }, padreId: nodo.padreId, propietarioId: nodo.propietarioId, nombre: nombre.trim() });
+                const dup = await Nodo.exists({ _id: { $ne: nodo._id }, padreId: nodo.padreId, nombre: nombre.trim() });
                 if (dup) return res.status(409).json({ error: 'Ya existe un elemento con ese nombre aquí' });
                 nodo.nombre = nombre.trim();
             }
             if (visibilidad !== undefined) {
                 if (!['privada', 'publica'].includes(visibilidad)) return res.status(400).json({ error: 'Visibilidad no válida' });
                 nodo.visibilidad = visibilidad;
-                if (nodo.tipo === 'carpeta') {   // el contenido hereda la visibilidad de la carpeta
+                if (visibilidad === 'privada') nodo.compartidoCon = [];   // "Privada" = solo yo
+                if (nodo.tipo === 'carpeta') {   // el contenido hereda visibilidad y accesos de la carpeta
                     const ids = (await descendientes(nodo._id)).map(d => d._id);
-                    await Nodo.updateMany({ _id: { $in: ids } }, { $set: { visibilidad } });
+                    const set = { visibilidad }; if (visibilidad === 'privada') set.compartidoCon = [];
+                    await Nodo.updateMany({ _id: { $in: ids } }, { $set: set });
                 }
             }
             await nodo.save();
+            avisar(req);
             res.json(dto(nodo, req.u.id));
         } catch (e) { err(res, e); }
     });
@@ -175,11 +196,12 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
         try {
             const nodo = await Nodo.findById(req.params.id);
             if (!nodo) return res.status(404).json({ error: 'No encontrado' });
-            if (nodo.propietarioId !== req.u.id) return res.status(403).json({ error: 'Solo el propietario puede eliminarlo' });
+            if (!puedeModificar(nodo, req.u.id)) return res.status(403).json({ error: 'No tienes permiso para eliminarlo' });
             const todos = [nodo, ...(await descendientes(nodo._id))];
             const archivoIds = todos.map(n => n.archivoId).filter(Boolean);
             if (archivoIds.length) await CRMArchivo.deleteMany({ _id: { $in: archivoIds } });
             await Nodo.deleteMany({ _id: { $in: todos.map(n => n._id) } });
+            avisar(req);
             res.json({ ok: true, eliminados: todos.length });
         } catch (e) { err(res, e); }
     });
@@ -192,8 +214,108 @@ module.exports = function registrarArchivosCrm({ app, mongoose, upload, CRMArchi
             const arch = await CRMArchivo.findById(nodo.archivoId);
             if (!arch) return res.status(404).json({ error: 'Contenido no encontrado' });
             res.set('Content-Type', arch.contentType || 'application/octet-stream');
-            res.set('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(nodo.nombre)}`);
+            res.set('Content-Disposition', `${req.query.descargar ? 'attachment' : 'inline'}; filename*=UTF-8''${encodeURIComponent(nodo.nombre)}`);
             res.send(Buffer.from(arch.datos, 'base64'));
+        } catch (e) { err(res, e); }
+    });
+
+    // ======================= FASE 2 =======================
+    // ---------- Compartir con usuarios específicos (solo el propietario) ----------
+    // body: { usuarios: [{ userId, nombre, permiso: 'lectura' | 'edicion' }] }  ([] = dejar de compartir)
+    app.put('/api/archivos-crm/:id/compartir', auth, async (req, res) => {
+        try {
+            const nodo = await Nodo.findById(req.params.id);
+            if (!nodo) return res.status(404).json({ error: 'No encontrado' });
+            if (nodo.propietarioId !== req.u.id) return res.status(403).json({ error: 'Solo el propietario puede compartir' });
+            const vistos = new Set();
+            const lista = (Array.isArray(req.body?.usuarios) ? req.body.usuarios : [])
+                .map(c => ({ userId: String(c.userId || '').trim(), nombre: String(c.nombre || '').slice(0, 120), permiso: c.permiso === 'edicion' ? 'edicion' : 'lectura' }))
+                .filter(c => c.userId && c.userId !== req.u.id && !vistos.has(c.userId) && vistos.add(c.userId));
+            const antes = new Set((nodo.compartidoCon || []).map(c => c.userId));
+            const visibilidad = nodo.visibilidad === 'publica' ? 'publica' : (lista.length ? 'compartida' : 'privada');
+            nodo.compartidoCon = lista; nodo.visibilidad = visibilidad;
+            const ids = nodo.tipo === 'carpeta' ? (await descendientes(nodo._id)).map(d => d._id) : [];
+            if (ids.length) await Nodo.updateMany({ _id: { $in: ids } }, { $set: { compartidoCon: lista, visibilidad } });
+            await nodo.save();
+            const nuevos = lista.map(c => c.userId).filter(id => !antes.has(id));
+            avisar(req, { compartidoA: nuevos, por: req.u.nombre, nombre: nodo.nombre });
+            res.json(dto(nodo, req.u.id));
+        } catch (e) { err(res, e); }
+    });
+
+    // ---------- Árbol de carpetas (las que puedo leer) ----------
+    app.get('/api/archivos-crm/arbol', auth, async (req, res) => {
+        try {
+            const u = req.u.id;
+            const todas = await Nodo.find({ tipo: 'carpeta', $or: [{ propietarioId: u }, { 'compartidoCon.userId': u }] }).select('nombre padreId propietarioId compartidoCon');
+            res.json({ carpetas: todas.map(c => ({ _id: c._id, nombre: c.nombre, padreId: c.padreId, esMio: c.propietarioId === u, editable: puedeEditar(c, u) })) });
+        } catch (e) { err(res, e); }
+    });
+
+    // ---------- Mover (solo dentro de lo que es mío) ----------
+    app.put('/api/archivos-crm/:id/mover', auth, async (req, res) => {
+        try {
+            const u = req.u.id, destinoId = req.body?.destinoId || null;
+            const nodo = await Nodo.findById(req.params.id);
+            if (!nodo) return res.status(404).json({ error: 'No encontrado' });
+            if (nodo.propietarioId !== u) return res.status(403).json({ error: 'Solo puedes mover elementos tuyos' });
+            let destino = null;
+            if (destinoId) {
+                destino = await Nodo.findById(destinoId);
+                if (!destino || destino.tipo !== 'carpeta' || destino.propietarioId !== u) return res.status(403).json({ error: 'Solo puedes mover a carpetas tuyas' });
+                const desc = nodo.tipo === 'carpeta' ? (await descendientes(nodo._id)).map(d => d._id) : [];
+                if (destinoId === nodo._id || desc.includes(destinoId)) return res.status(400).json({ error: 'No se puede mover una carpeta dentro de sí misma' });
+            }
+            if ((nodo.padreId || null) === destinoId) return res.json(dto(nodo, u));
+            nodo.padreId = destinoId;
+            nodo.nombre = await nombreLibre(destinoId, nodo.nombre);
+            nodo.visibilidad = destino ? destino.visibilidad : 'privada';
+            nodo.compartidoCon = destino ? destino.compartidoCon : [];
+            if (nodo.tipo === 'carpeta') {
+                const ids = (await descendientes(nodo._id)).map(d => d._id);
+                if (ids.length) await Nodo.updateMany({ _id: { $in: ids } }, { $set: { visibilidad: nodo.visibilidad, compartidoCon: nodo.compartidoCon } });
+            }
+            await nodo.save();
+            avisar(req);
+            res.json(dto(nodo, u));
+        } catch (e) { err(res, e); }
+    });
+
+    // ---------- Copiar (a una carpeta donde tenga permiso de edición) ----------
+    app.post('/api/archivos-crm/:id/copiar', auth, async (req, res) => {
+        try {
+            const u = req.u.id, destinoId = req.body?.destinoId || null;
+            const origen = await Nodo.findById(req.params.id);
+            if (!origen || !puedeLeer(origen, u)) return res.status(404).json({ error: 'No encontrado' });
+            let destino = null;
+            if (destinoId) {
+                destino = await Nodo.findById(destinoId);
+                if (!destino || destino.tipo !== 'carpeta' || !puedeEditar(destino, u)) return res.status(403).json({ error: 'No tienes permiso en la carpeta destino' });
+                if (origen.tipo === 'carpeta') {
+                    const desc = (await descendientes(origen._id)).map(d => d._id);
+                    if (destinoId === origen._id || desc.includes(destinoId)) return res.status(400).json({ error: 'No se puede copiar una carpeta dentro de sí misma' });
+                }
+            }
+            const base = {
+                propietarioId: destino ? destino.propietarioId : u, propietarioNombre: destino ? destino.propietarioNombre : req.u.nombre,
+                creadoPorNombre: req.u.nombre, visibilidad: destino ? destino.visibilidad : 'privada', compartidoCon: destino ? destino.compartidoCon : []
+            };
+            let total = 0;
+            async function clonar(n, padreDestino) {
+                const copia = { ...base, tipo: n.tipo, padreId: padreDestino, nombre: await nombreLibre(padreDestino, n.nombre), contentType: n.contentType, tamanio: n.tamanio };
+                if (n.tipo === 'archivo') {
+                    const a = await CRMArchivo.findById(n.archivoId);
+                    if (!a) return null;
+                    const nuevo = await CRMArchivo.create({ nombre: a.nombre, contentType: a.contentType, datos: a.datos, tamanio: a.tamanio });
+                    copia.archivoId = String(nuevo._id);
+                }
+                const creado = await Nodo.create(copia); total++;
+                if (n.tipo === 'carpeta') for (const h of await Nodo.find({ padreId: n._id })) await clonar(h, creado._id);
+                return creado;
+            }
+            const raiz = await clonar(origen, destinoId);
+            avisar(req);
+            res.json({ ok: true, copiados: total, item: raiz ? dto(raiz, u) : null });
         } catch (e) { err(res, e); }
     });
 };
