@@ -3866,15 +3866,22 @@ app.get('/api/clientes/mis-cotizaciones', authCliente, async (req, res) => {
             // Un administrador puede ver todas las cotizaciones en proceso o terminadas
             query = { estado: { $nin: ['Neutral'] } };
         } else {
-            // Un cliente solo ve las suyas
+            // Un cliente solo ve las suyas.
+            // - Si el admin le otorgó acceso explícito (accesosPortal), se muestra en cualquier estado,
+            //   incluido 'Neutral'.
+            // - Las coincidencias implícitas (contacto/empresa/correo) siguen ocultando 'Neutral'.
             query = {
                 $or: [
-                    { 'contacto': req.cliente.nombre },
-                    { 'clienteNombre': req.cliente.empresa },
-                    { 'creadorCorreo': req.cliente.correo },
-                    { 'accesosPortal': req.cliente._id.toString() }
-                ],
-                estado: { $nin: ['Neutral'] }
+                    { 'accesosPortal': req.cliente._id.toString() },
+                    {
+                        estado: { $nin: ['Neutral'] },
+                        $or: [
+                            { 'contacto': req.cliente.nombre },
+                            { 'clienteNombre': req.cliente.empresa },
+                            { 'creadorCorreo': req.cliente.correo }
+                        ]
+                    }
+                ]
             };
         }
 
