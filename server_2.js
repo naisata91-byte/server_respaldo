@@ -1442,6 +1442,17 @@ app.get('/api/cotizaciones/:id/version-cliente', async (req, res) => {
     } catch(err) { res.status(500).json({error: err.message}); }
 });
 
+// Normaliza la fecha de una cotización. 'YYYY-MM-DD' se guarda al mediodía UTC (evita corrimientos de día por zona horaria).
+// Devuelve un Date válido, o null si viene vacía/inválida (en ese caso no se modifica la fecha).
+function normalizarFechaCotizacion(valor) {
+    if (valor === undefined || valor === null || valor === '') return null;
+    let f;
+    if (typeof valor === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(valor)) f = new Date(`${valor}T12:00:00.000Z`);
+    else f = new Date(valor);
+    if (isNaN(f.getTime()) || f.getUTCFullYear() < 2000 || f.getUTCFullYear() > 2100) return null;
+    return f;
+}
+
 app.post('/api/cotizaciones', async (req, res) => {
     try {
         const data = req.body;
@@ -1471,6 +1482,8 @@ app.post('/api/cotizaciones', async (req, res) => {
             }
         }
 
+        const fechaNueva = normalizarFechaCotizacion(data.fechaCreacion);
+        if (fechaNueva) data.fechaCreacion = fechaNueva; else delete data.fechaCreacion;
         const newCotizacion = new CRMCotizacion({ ...data, revision: 1, colaboracionActualizadaEn: new Date() });
         recalcularCotizacion(newCotizacion);
         await newCotizacion.save();
@@ -1489,7 +1502,7 @@ app.post('/api/cotizaciones', async (req, res) => {
 // propias rutas para que nunca se pisen entre usuarios.
 app.patch('/api/cotizaciones/:id/campos', async (req, res) => {
     try {
-        const permitidos = ['clienteId', 'clienteNombre', 'descripcion', 'lugarEjecucion', 'contacto', 'categoria', 'condiciones', 'notas', 'estado', 'fechaSeguimiento', 'requiereRevision', 'esBorrador', 'folio', 'archivos'];
+        const permitidos = ['clienteId', 'clienteNombre', 'descripcion', 'lugarEjecucion', 'contacto', 'categoria', 'condiciones', 'notas', 'estado', 'fechaSeguimiento', 'fechaCreacion', 'requiereRevision', 'esBorrador', 'folio', 'archivos'];
         const cambios = {};
         permitidos.forEach(campo => {
             if (Object.prototype.hasOwnProperty.call(req.body || {}, campo)) cambios[campo] = req.body[campo];
@@ -1498,6 +1511,10 @@ app.patch('/api/cotizaciones/:id/campos', async (req, res) => {
         if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
         
         const eraBorrador = cot.esBorrador === true;
+        if (Object.prototype.hasOwnProperty.call(cambios, 'fechaCreacion')) {
+            const fechaNueva = normalizarFechaCotizacion(cambios.fechaCreacion);
+            if (fechaNueva) cambios.fechaCreacion = fechaNueva; else delete cambios.fechaCreacion;
+        }
         if (typeof cambios.folio === 'string' && ['Asignación Automática', 'Sin folio', 'Personalizado'].includes(cambios.folio.trim())) delete cambios.folio;
         if (cambios.folio && cambios.folio.trim() !== '' && cambios.folio !== cot.folio) {
             const existe = await CRMCotizacion.findOne({ folio: cambios.folio.trim() });
@@ -1655,6 +1672,10 @@ app.put('/api/cotizaciones/:id', async (req, res) => {
             delete data.folio;
         }
 
+        if (Object.prototype.hasOwnProperty.call(data, 'fechaCreacion')) {
+            const fechaNueva = normalizarFechaCotizacion(data.fechaCreacion);
+            if (fechaNueva) data.fechaCreacion = fechaNueva; else delete data.fechaCreacion;
+        }
         const updatedCot = await CRMCotizacion.findByIdAndUpdate(id, data, { returnDocument: 'after' });
 
         // Sincronizar la descripción en el Proyecto Operativo Activo (si existe)
