@@ -3979,7 +3979,7 @@ app.get('/api/clientes/proyectos/:id', authCliente, async (req, res) => {
 app.post('/api/clientes/cotizaciones/:id/modificar', authCliente, async (req, res) => {
     try {
         const { id } = req.params;
-        const { partidas, notas, clienteNombre, contacto } = req.body;
+        const { partidas, notas, clienteNombre, contacto, fecha } = req.body;
         
         const original = await CRMCotizacion.findById(id);
         if (!original) return res.status(404).json({ error: 'Cotización original no encontrada' });
@@ -4005,6 +4005,18 @@ app.post('/api/clientes/cotizaciones/:id/modificar', authCliente, async (req, re
         const errorContacto = validarTextoEncabezado(contacto, 'contacto');
         if (errorCliente || errorContacto) {
             return res.status(400).json({ error: errorCliente || errorContacto });
+        }
+        // Fecha editable (formato YYYY-MM-DD). Se guarda al mediodía UTC para evitar corrimientos por zona horaria.
+        let fechaActualizada = null;
+        if (fecha !== undefined && fecha !== null && fecha !== '') {
+            if (typeof fecha !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(fecha)) {
+                return res.status(400).json({ error: 'El campo fecha no es válido' });
+            }
+            const f = new Date(`${fecha}T12:00:00.000Z`);
+            if (isNaN(f.getTime()) || f.getUTCFullYear() < 2000 || f.getUTCFullYear() > 2100) {
+                return res.status(400).json({ error: 'El campo fecha no es válido' });
+            }
+            fechaActualizada = f;
         }
         const clienteNombreActualizado = typeof clienteNombre === 'string' ? clienteNombre.trim() : original.clienteNombre;
         const contactoActualizado = typeof contacto === 'string' ? contacto.trim() : original.contacto;
@@ -4034,7 +4046,7 @@ app.post('/api/clientes/cotizaciones/:id/modificar', authCliente, async (req, re
             original.subtotal = subtotal;
             original.iva = iva;
             original.total = total;
-            original.fechaCreacion = new Date(); // Actualizamos la fecha de la copia
+            original.fechaCreacion = fechaActualizada || new Date(); // Fecha elegida por el cliente (o ahora si no se envió)
             // Actualizar notas si se enviaron
             if (typeof notas === 'string') original.notas = notas;
             original.clienteNombre = clienteNombreActualizado;
@@ -4057,7 +4069,7 @@ app.post('/api/clientes/cotizaciones/:id/modificar', authCliente, async (req, re
                 notas: typeof notas === 'string' ? notas : original.notas,
                 clienteNombre: clienteNombreActualizado,
                 contacto: contactoActualizado,
-                fechaCreacion: new Date(),
+                fechaCreacion: fechaActualizada || new Date(),
                 estado: 'En Proceso', // estado para la copia
                 cotizacionOriginalId: original._id.toString(),
                 esModificadaPorCliente: true,
