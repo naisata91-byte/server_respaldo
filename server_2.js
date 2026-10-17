@@ -3809,6 +3809,14 @@ async function authCliente(req, res, next) {
     next();
 }
 
+// Inventario de red del portal de clientes (modulo aparte: inventario-routes.js)
+try {
+    require('./inventario-routes')({ app, mongoose, authCliente });
+} catch (e) {
+    // Si falta o falla el modulo, el servidor NO debe dejar de arrancar.
+    process.stderr.write('[Inventario] Modulo no cargado: ' + (e && e.message) + '\n');
+}
+
 // Obtener datos del cliente actual
 app.get('/api/clientes/me', authCliente, (req, res) => {
     res.json({ 
