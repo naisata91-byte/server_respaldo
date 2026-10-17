@@ -15,6 +15,7 @@
 const LIM = { sucursales: 200, sites: 500, equipos: 2000, puntos: 20000 };
 const TIPOS_EQ = ['switch', 'patch', 'nvr'];
 const ESTADOS = ['activo', 'falla', 'libre', 'retirado'];
+const MAX_PROPIOS = 10;   // inventarios que un cliente (no admin) puede crear por su cuenta
 
 /* ── Sanitización (funciones puras, sin dependencias) ───────────────────── */
 const str = (v, max = 120) => (v == null ? '' : String(v)).trim().slice(0, max);
@@ -98,6 +99,7 @@ module.exports = function ({ app, mongoose, authCliente }) {
             vlan: Number, ip: String, mac: String, ubicacion: String, estado: String, proyecto: String, fecha: String
         }],
         version: { type: Number, default: 1 },
+        creadoPor: String,
         actualizadoPor: String,
         actualizadoEn: Date,
         creadoEn: { type: Date, default: Date.now }
@@ -169,12 +171,18 @@ module.exports = function ({ app, mongoose, authCliente }) {
     });
 
     // ── Administración (solo Naisata) ──────────────────────────────────────
+    // Crear un inventario: NO depende de proyectos. Cualquier cliente aprobado puede crear el suyo
+    // (queda como editor); el admin de Naisata puede crear los que quiera y asignarlos después.
     app.post('/api/clientes/inventarios', authCliente, async (req, res) => {
         try {
-            if (!soloAdmin(req, res)) return;
             const nombre = str(req.body && req.body.nombre, 100);
             if (!nombre) return res.status(400).json({ error: 'Escribe el nombre de la empresa' });
-            const inv = await CRMInventario.create({ nombre, sucursales: [], sites: [], equipos: [], puntos: [] });
+            const admin = !!req.cliente.isAdmin;
+            if (!admin) {
+                const propios = await CRMInventario.countDocuments({ creadoPor: miId(req) });
+                if (propios >= MAX_PROPIOS) return res.status(400).json({ error: `Ya creaste ${MAX_PROPIOS} inventarios. Pide a Naisata si necesitas más.` });
+            }
+            const inv = await CRMInventario.create({ nombre, creadoPor: miId(req), editoresPortal: admin ? [] : [miId(req)], sucursales: [], sites: [], equipos: [], puntos: [] });
             res.json({ _id: inv._id, nombre: inv.nombre });
         } catch (e) { falla(res, e); }
     });
