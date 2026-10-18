@@ -33,6 +33,25 @@ const clonar = v => JSON.parse(JSON.stringify(v || []));
 const hoyMx = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
 
 /* ── Funciones puras (también las usan las pruebas) ─────────────────────── */
+const PALABRAS_VACIAS = new Set(['de', 'del', 'la', 'el', 'los', 'las', 'en', 'y']);
+const tokens = t => norm(t).split(' ').filter(w => w && !PALABRAS_VACIAS.has(w));
+const esIdent = w => w.length === 1 || /\d/.test(w);   /* "c", "b", "2", "a1": distinguen equipos parecidos, nunca se toleran errores */
+function distancia(a, b) {
+    const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+    for (let j = 1; j <= b.length; j++) d[0][j] = j;
+    for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    return d[a.length][b.length];
+}
+/* null = no se parecen; 0 = mismo nombre (mayúsculas, acentos, espacios o "de/la" aparte); n = n letras de diferencia */
+function parecido(a, b) {
+    const ta = tokens(a), tb = tokens(b); if (!ta.length || !tb.length) return null;
+    if (ta.filter(esIdent).sort().join('|') !== tb.filter(esIdent).sort().join('|')) return null;
+    const ra = ta.filter(w => !esIdent(w)).join(''), rb = tb.filter(w => !esIdent(w)).join('');
+    if (ra === rb) return 0;
+    if (Math.min(ra.length, rb.length) < 4) return null;
+    const d = distancia(ra, rb);
+    return d <= Math.max(1, Math.floor(Math.max(ra.length, rb.length) * 0.2)) ? d : null;
+}
 function resolver(lista, id, nombre, filtro) {
     const base = filtro ? lista.filter(filtro) : lista;
     if (id && typeof id === 'string') { const x = base.find(e => e.id === id); if (x) return x; }
@@ -41,8 +60,12 @@ function resolver(lista, id, nombre, filtro) {
     const exactos = base.filter(x => norm(x.nombre) === n);
     if (exactos.length === 1) return exactos[0];
     if (exactos.length > 1) return null;
+    const cercanos = base.map(x => ({ x, d: parecido(nombre, x.nombre) })).filter(c => c.d !== null).sort((p, q) => p.d - q.d);
+    if (cercanos.length === 1 || (cercanos.length > 1 && cercanos[0].d < cercanos[1].d)) return cercanos[0].x;
+    if (cercanos.length > 1) return null;
     if (n.length >= 3) {
-        const parciales = base.filter(x => { const m = norm(x.nombre); return m.length >= 3 && (m.includes(n) || n.includes(m)); });
+        const idn = tokens(n).filter(esIdent).sort().join('|');
+        const parciales = base.filter(x => { const m = norm(x.nombre); return m.length >= 3 && (m.includes(n) || n.includes(m)) && (!idn || tokens(m).filter(esIdent).sort().join('|') === idn); });
         if (parciales.length === 1) return parciales[0];
     }
     return null;
@@ -82,6 +105,8 @@ function normalizarPropuesta(raw, est, helpers) {
             switchId: eq.switchId ? eq.switchId.id : '', swPuerto: puerto(eq.switchId, r.swPuerto),
             patchId: eq.patchId ? eq.patchId.id : '', patchPuerto: puerto(eq.patchId, r.patchPuerto),
             nvrId: eq.nvrId ? eq.nvrId.id : '', nvrCanal: puerto(eq.nvrId, r.nvrCanal),
+            siteNombre: site ? '' : str(r.siteNombre, 120), sucursalNombre: suc ? '' : str(r.sucursalNombre, 120),
+            patchNombre: eq.patchId ? '' : str(r.patchNombre, 60), switchNombre: eq.switchId ? '' : str(r.switchNombre, 60), nvrNombre: eq.nvrId ? '' : str(r.nvrNombre, 60),
             ubicacion: str(r.ubicacion, 200), ip: str(r.ip, 45), mac: str(r.mac, 30), vlan: num(r.vlan),
             faltantes
         };
@@ -123,7 +148,7 @@ Responde SOLO con un JSON válido con esta forma:
 Reglas:
 - Un punto por cada dispositivo físico instalado (nodo de red, cámara, access point, teléfono, etc.). Si dice "2 nodos", crea 2 puntos ("Nodo 1", "Nodo 2") y asigna los puertos en el orden en que se mencionan: el primer puerto de cada equipo al primer nodo, el segundo al segundo.
 - tipo debe ser exactamente uno de: ${TIPOS_PUNTO.join(' | ')}.
-- Usa SOLO los ids de la ESTRUCTURA EXISTENTE que recibes. Si el site o el equipo (patch panel, switch, NVR) que menciona la descripción corresponde claramente a uno existente, pon su id. Si no corresponde a ninguno, deja el id en null y escribe el nombre mencionado en el campo Nombre. Tolera mayúsculas, acentos y abreviaturas ("sw cisco a" = un switch existente llamado parecido).
+- Usa SOLO los ids de la ESTRUCTURA EXISTENTE que recibes. Si el site o el equipo (patch panel, switch, NVR) que menciona la descripción corresponde claramente a uno existente, pon su id. Si no corresponde a ninguno, deja el id en null y escribe el nombre mencionado en el campo Nombre. Tolera mayúsculas, acentos, errores de dedo y abreviaturas ("sw cisco a" = un switch existente llamado parecido), pero NUNCA confundas equipos que solo difieren en su letra o número ("panel c" ≠ "panel d"). Escribe el nombre del site/equipo tal como lo dice la descripción; no crees dos nombres distintos para el mismo equipo.
 - patchPuerto/swPuerto/nvrCanal son números enteros. Si no se mencionan, null. NUNCA inventes puertos, IPs, MACs ni VLANs.
 - "ubicacion" es la ubicación física del dispositivo (ej. "almacén, esquina", "supervisión", "planta 2").
 - Si algo es ambiguo o falta, agrégalo en "pendientes" con una frase corta.
@@ -316,6 +341,63 @@ module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitiza
         } catch (e) { falla(res, e); }
     });
 
+    /* Crea (sin duplicar) los sites y equipos que la descripción menciona y todavía no existen.
+       Modifica `draft`; devuelve los puntos con ids, lo creado y los problemas por punto. */
+    const TAM = { switch: [8, 16, 24, 48, 96], patch: [12, 24, 48, 96], nvr: [4, 8, 16, 32, 64] };
+    const TAM_BASE = { switch: 24, patch: 24, nvr: 16 };
+    function materializar(draft, entrada, nombreCliente) {
+        const creados = { sites: [], equipos: [] };
+        const salida = entrada.map(p => ({ ...p }));
+        const problemas = salida.map(() => []);
+        salida.forEach((p, i) => {
+            if (!draft.sites.some(t => t.id === str(p.siteId, 40))) p.siteId = '';
+            const nombreSite = str(p.siteNombre, 120);
+            if (p.siteId || !norm(nombreSite)) return;
+            let site = resolver(draft.sites, '', nombreSite);
+            if (!site) {
+                let suc = resolver(draft.sucursales, str(p.sucursalId, 40), p.sucursalNombre);
+                if (!suc) {
+                    const nombreSuc = str(p.sucursalNombre, 120);
+                    if (norm(nombreSuc)) suc = { id: nuevoId('s'), nombre: nombreSuc, clave: '', direccion: '' };
+                    else if (draft.sucursales.length === 1) suc = draft.sucursales[0];
+                    else if (!draft.sucursales.length) suc = { id: nuevoId('s'), nombre: str(nombreCliente, 120) || 'Principal', clave: '', direccion: '' };
+                    else { problemas[i].push(`Elige la sucursal del site «${nombreSite}»`); return; }
+                    if (!draft.sucursales.includes(suc)) draft.sucursales.push(suc);
+                }
+                site = { id: nuevoId('t'), sucursalId: suc.id, tipo: /\bidf\b/i.test(nombreSite) ? 'IDF' : 'MDF', nombre: nombreSite, ubicacion: '' };
+                draft.sites.push(site); creados.sites.push(site.nombre);
+            }
+            p.siteId = site.id;
+        });
+        /* equipos: primero los que ya existen; los demás se agrupan por nombre parecido y se crean una sola vez */
+        const nuevos = [];
+        salida.forEach((p, i) => {
+            for (const [k, pk, lab, tipo] of CAMPOS) {
+                const nombre = str(p[k.replace('Id', 'Nombre')], 60);
+                if ((p[k] && draft.equipos.some(e => e.id === p[k])) || !norm(nombre)) continue;
+                p[k] = '';
+                if (!p.siteId) { problemas[i].push(`Falta el site para crear el ${lab} «${nombre}»`); continue; }
+                if (resolver(draft.equipos, '', nombre, e => e.tipo === tipo && e.siteId === p.siteId)) continue;
+                let g = resolver(nuevos, '', nombre, x => x.tipo === tipo && x.siteId === p.siteId);
+                if (!g) { g = { tipo, siteId: p.siteId, nombre, max: 0 }; nuevos.push(g); }
+                g.max = Math.max(g.max, num(p[pk]) || 0);
+            }
+        });
+        for (const g of nuevos) {
+            const puertos = TAM[g.tipo].find(n => n >= Math.max(g.max, TAM_BASE[g.tipo])) || Math.ceil(g.max / 8) * 8;
+            draft.equipos.push({ id: nuevoId('e'), siteId: g.siteId, tipo: g.tipo, nombre: g.nombre, modelo: '', ip: '', puertos, rack: '' });
+            creados.equipos.push(`${g.nombre} (${puertos} ${g.tipo === 'nvr' ? 'canales' : 'puertos'})`);
+        }
+        salida.forEach(p => {
+            for (const [k, , , tipo] of CAMPOS) {
+                if (p[k] && draft.equipos.some(e => e.id === p[k])) continue;
+                const e = resolver(draft.equipos, '', p[k.replace('Id', 'Nombre')], x => x.tipo === tipo && x.siteId === p.siteId);
+                p[k] = e ? e.id : '';
+            }
+        });
+        return { entrada: salida, creados, problemas };
+    }
+
     /* Convierte lo que mandó el navegador en puntos del inventario (misma lógica para validar y aplicar). */
     function construirPuntos(entrada, draft, folio, entregableId) {
         return entrada.map(p => {
@@ -337,11 +419,12 @@ module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitiza
             const b = req.body || {};
             const entregableId = str(b.entregableId, 40);
             const inv = await buscarInventario(str(b.siteId, 60), str(b.siteNombre, 120));
-            const entrada = entradaPuntos(b);
-            if (!inv) return res.json({ avisos: entrada.map(() => [{ nivel: 'error', texto: 'Falta asignar el site' }]) });
-            const draft = { sites: clonar(inv.sites), equipos: clonar(inv.equipos) };
-            const nuevos = construirPuntos(entrada, draft, '', entregableId);
-            res.json({ avisos: evaluar(draft.equipos, clonar(inv.puntos), nuevos, entregableId) });
+            const draft = { sucursales: clonar(inv && inv.sucursales), sites: clonar(inv && inv.sites), equipos: clonar(inv && inv.equipos) };
+            const m = materializar(draft, entradaPuntos(b), str(b.siteNombre, 120));
+            const nuevos = construirPuntos(m.entrada, draft, '', entregableId);
+            const avisos = evaluar(draft.equipos, clonar(inv && inv.puntos), nuevos, entregableId);
+            m.problemas.forEach((lista, i) => lista.forEach(texto => avisos[i].push({ nivel: 'error', texto })));
+            res.json({ avisos, creados: m.creados });
         } catch (e) { falla(res, e); }
     });
 
@@ -353,20 +436,21 @@ module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitiza
             if (!/^[\w-]{1,40}$/.test(entregableId)) throw httpErr(400, 'Entregable inválido');
             const entrada = entradaPuntos(b);
             if (!entrada.length) throw httpErr(400, 'No hay puntos que agregar');
-            const inv0 = await buscarInventario(str(b.siteId, 60), str(b.siteNombre, 120));
-            if (!inv0) throw httpErr(409, 'Este cliente aún no tiene inventario. Usa "Asignarle site" primero.', { faltaEstructura: true });
+            const inv0 = await obtenerOCrear(str(b.siteId, 60), str(b.siteNombre, 120), req.empleado);
             const folio = str(b.folio, 60), forzar = b.forzar === true;
             const { inv, extra } = await mutar(inv0._id, req.empleado, draft => {
                 const quitados = draft.puntos.filter(p => p.entregableId === entregableId).length;
                 draft.puntos = draft.puntos.filter(p => p.entregableId !== entregableId);
-                const nuevos = construirPuntos(entrada, draft, folio, entregableId);
+                const m = materializar(draft, entrada, str(b.siteNombre, 120));
+                const nuevos = construirPuntos(m.entrada, draft, folio, entregableId);
                 const avisos = evaluar(draft.equipos, draft.puntos, nuevos, entregableId);
                 const errores = [], conflictos = [];
+                m.problemas.forEach((lista, i) => lista.forEach(texto => errores.push(`${nuevos[i].nombre}: ${texto}`)));
                 avisos.forEach((lista, i) => lista.forEach(a => (a.nivel === 'error' ? errores : conflictos).push(`${nuevos[i].nombre}: ${a.texto}`)));
                 if (errores.length) throw httpErr(400, 'Hay datos por corregir: ' + errores.join(' · '), { errores });
                 if (conflictos.length && !forzar) throw httpErr(409, 'Hay puertos ocupados: ' + conflictos.join(' · '), { conflictos });
                 draft.puntos.push(...nuevos);
-                return { agregados: nuevos.length, reemplazados: quitados };
+                return { agregados: nuevos.length, reemplazados: quitados, creados: m.creados };
             });
             res.json({ ok: true, version: inv.version, ...extra });
         } catch (e) { falla(res, e); }
@@ -487,4 +571,5 @@ module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitiza
 module.exports.normalizarPropuesta = normalizarPropuesta;
 module.exports.evaluar = evaluar;
 module.exports.resolver = resolver;
+module.exports.parecido = parecido;
 module.exports.TIPOS_PUNTO = TIPOS_PUNTO;
