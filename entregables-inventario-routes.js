@@ -485,12 +485,29 @@ module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitiza
         if (req.cliente.isAdmin) return { admin: true };
         const yo = String(req.cliente._id);
         const Proyecto = mongoose.models.CRMProyecto;
-        const proyectos = Proyecto ? await Proyecto.find({ accesosPortal: yo }).select('_id folio').lean() : [];
-        const invs = await CRMInventario.find({ siteId: { $exists: true, $nin: ['', null] }, $or: [{ accesosPortal: yo }, { editoresPortal: yo }] }).select('siteId').lean();
+
+        // La lista de entregables debe seguir disponible aunque una colección
+        // auxiliar (proyectos, inventarios o membresías) esté temporalmente
+        // indisponible. Antes, cualquiera de estas lecturas devolvía un 500 y
+        // el portal mostraba el confuso mensaje “Error en el servidor del
+        // inventario” incluso para un entregable que sí era accesible.
+        const resultados = await Promise.allSettled([
+            Proyecto ? Proyecto.find({ accesosPortal: yo }).select('_id folio').lean() : Promise.resolve([]),
+            CRMInventario.find({ siteId: { $exists: true, $nin: ['', null] }, $or: [{ accesosPortal: yo }, { editoresPortal: yo }] }).select('siteId').lean(),
+            PC().sitesCon(req.cliente, 'entregables', 'ver')
+        ]);
+        const valor = (indice, defecto) => resultados[indice].status === 'fulfilled' ? resultados[indice].value : defecto;
+        resultados.forEach((resultado, indice) => {
+            if (resultado.status === 'rejected') {
+                try { console.error(`[Entregables] No se pudo consultar el alcance ${indice}:`, resultado.reason); } catch (_) { /* sin log */ }
+            }
+        });
+        const proyectos = valor(0, []);
+        const invs = valor(1, []);
+        const siteMemb = valor(2, []);
         const proyIds = proyectos.map(p => String(p._id));
         const folios = proyectos.map(p => String(p.folio || '').trim()).filter(Boolean);
-        const siteMemb = await PC().sitesCon(req.cliente, 'entregables', 'ver');   // clientes (sites) de los que la cuenta es miembro
-        return { admin: false, proyIds, folios, siteIds: [...new Set([...invs.map(i => String(i.siteId)), ...siteMemb])] };
+        return { admin: false, proyIds, folios, siteIds: [...new Set([...invs.map(i => String(i.siteId)), ...siteMemb.map(String)])] };
     }
     function filtroAlcance(a) {
         if (a.admin) return {};
@@ -504,18 +521,25 @@ module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitiza
     app.get('/api/clientes/mis-entregables', authCliente, async (req, res) => {
         try {
             const a = await alcance(req);
-            const lista = await tickets().aggregate([
-                { $match: filtroAlcance(a) },
-                { $sort: { createdAt: -1, _id: -1 } },
-                { $limit: 300 },
-                { $project: {
-                    _id: 0, id: { $toString: '$_id' }, folio: 1, titulo: { $ifNull: ['$titulo', '$nombreTrabajo'] }, descripcion: 1, estado: 1,
-                    createdAt: 1, fechaFirma: 1, nombreCliente: 1,
-                    firmado: { $gt: [{ $strLenCP: { $ifNull: [{ $cond: [{ $eq: [{ $type: '$firmaCliente' }, 'string'] }, '$firmaCliente', ''] }, ''] } }, 0] },
-                    nFotos: { $cond: [{ $isArray: '$fotos' }, { $size: '$fotos' }, 0] }
-                } }
-            ]).toArray();
-            res.json(lista);
+            // No usar una agregación aquí: instalaciones anteriores de MongoDB
+            // fallaban al evaluar $strLenCP/$toString sobre entregables antiguos
+            // con campos heterogéneos. La conversión en JavaScript es segura y
+            // mantiene la respuesta del portal estable para esos registros.
+            const lista = await tickets().find(filtroAlcance(a), {
+                projection: { folio: 1, titulo: 1, nombreTrabajo: 1, descripcion: 1, estado: 1, createdAt: 1, fechaFirma: 1, nombreCliente: 1, firmaCliente: 1, fotos: 1 }
+            }).sort({ createdAt: -1, _id: -1 }).limit(300).toArray();
+            res.json(lista.map(t => ({
+                id: String(t._id),
+                folio: t.folio || '',
+                titulo: t.titulo || t.nombreTrabajo || '',
+                descripcion: t.descripcion || '',
+                estado: t.estado || '',
+                createdAt: t.createdAt || null,
+                fechaFirma: t.fechaFirma || null,
+                nombreCliente: t.nombreCliente || '',
+                firmado: typeof t.firmaCliente === 'string' && t.firmaCliente.length > 0,
+                nFotos: Array.isArray(t.fotos) ? t.fotos.length : 0
+            })));
         } catch (e) { falla(res, e); }
     });
 
