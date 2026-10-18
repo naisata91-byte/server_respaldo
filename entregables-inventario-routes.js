@@ -157,6 +157,8 @@ Reglas:
 /* ── Módulo ─────────────────────────────────────────────────────────────── */
 module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitizarInventario, str, num }) {
     const db = () => mongoose.connection.db;
+    /* Cuentas del portal con membresías por cliente (portal-cuentas-routes.js); si no cargó, no aporta nada. */
+    const PC = () => (app.locals && app.locals.portalCuentas) || { sitesCon: async () => [] };
     const helpers = { str, num };
     const falla = (res, e) => {
         if (!e.status) { try { console.error('[Entregables→Inventario]', e); } catch (_) { /* sin log */ } }
@@ -487,7 +489,8 @@ module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitiza
         const invs = await CRMInventario.find({ siteId: { $exists: true, $nin: ['', null] }, $or: [{ accesosPortal: yo }, { editoresPortal: yo }] }).select('siteId').lean();
         const proyIds = proyectos.map(p => String(p._id));
         const folios = proyectos.map(p => String(p.folio || '').trim()).filter(Boolean);
-        return { admin: false, proyIds, folios, siteIds: invs.map(i => String(i.siteId)) };
+        const siteMemb = await PC().sitesCon(req.cliente, 'entregables', 'ver');   // clientes (sites) de los que la cuenta es miembro
+        return { admin: false, proyIds, folios, siteIds: [...new Set([...invs.map(i => String(i.siteId)), ...siteMemb])] };
     }
     function filtroAlcance(a) {
         if (a.admin) return {};
@@ -532,8 +535,9 @@ module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitiza
             DATOS_ACTA_PUBLICOS.forEach(k => { if (typeof acta[k] === 'string' && acta[k]) datosActa[k] = acta[k]; });
             const yo = String(req.cliente._id);
             const invs = await CRMInventario.find({ 'puntos.entregableId': id }).lean();
+            const sitesInv = await PC().sitesCon(req.cliente, 'inventario', 'ver');
             const puntos = [];
-            invs.filter(i => req.cliente.isAdmin || (i.accesosPortal || []).includes(yo) || (i.editoresPortal || []).includes(yo)).forEach(i => {
+            invs.filter(i => req.cliente.isAdmin || (i.accesosPortal || []).includes(yo) || (i.editoresPortal || []).includes(yo) || (i.siteId && sitesInv.includes(String(i.siteId)))).forEach(i => {
                 const eq = x => (i.equipos || []).find(e => e.id === x) || {};
                 (i.puntos || []).filter(p => p.entregableId === id).forEach(p => puntos.push({
                     nombre: p.nombre, tipo: p.tipo, estado: p.estado, ubicacion: p.ubicacion || '', ip: p.ip || '',

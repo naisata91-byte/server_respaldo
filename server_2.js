@@ -3809,6 +3809,21 @@ async function authCliente(req, res, next) {
     next();
 }
 
+// Cuentas del portal: membresías por cliente + permisos por módulo (modulo aparte: portal-cuentas-routes.js)
+// Valores por defecto: si el módulo no carga, el portal se comporta como antes.
+app.locals.portalCuentas = {
+    ajustarQueryCotizaciones: async (cliente, query) => query,
+    cotizacion: async (cliente, cot, esSuyaLegacy) => ({ ver: !!esSuyaLegacy, editar: false }),
+    queryProyectos: async cliente => ({ accesosPortal: String(cliente._id) }),
+    verProyecto: async () => false,
+    sitesCon: async () => [], nivel: async () => 0, tieneMembresias: async () => false
+};
+try {
+    require('./portal-cuentas-routes')({ app, mongoose, authCliente });
+} catch (e) {
+    process.stderr.write('[PortalCuentas] Modulo no cargado: ' + (e && e.message) + '\n');
+}
+
 // Inventario de red del portal de clientes (modulo aparte: inventario-routes.js)
 try {
     require('./inventario-routes')({ app, mongoose, authCliente });
@@ -3914,6 +3929,7 @@ app.get('/api/clientes/mis-cotizaciones', authCliente, async (req, res) => {
             };
         }
 
+        if (!req.cliente.isAdmin) query = await app.locals.portalCuentas.ajustarQueryCotizaciones(req.cliente, query);
         const cotizaciones = await CRMCotizacion.find({ ...query, esBorrador: { $ne: true } })
             .select('folio clienteNombre descripcion total estado fechaCreacion')
             .sort({ fechaCreacion: -1 });
@@ -3937,11 +3953,12 @@ app.get('/api/clientes/cotizaciones/:id/preview', authCliente, async (req, res) 
                        cot.creadorCorreo === req.cliente.correo ||
                        (cot.accesosPortal && cot.accesosPortal.includes(req.cliente._id.toString()));
 
-        if (!esSuya && !req.cliente.isAdmin) {
+        const _pc = await app.locals.portalCuentas.cotizacion(req.cliente, cot, esSuya);
+        if (!_pc.ver && !req.cliente.isAdmin) {
             return res.status(403).json({ error: 'No tienes permiso para ver esta cotización' });
         }
 
-        const puedeModificar = cot.permisosPortalModificacion && cot.permisosPortalModificacion.includes(req.cliente._id.toString());
+        const puedeModificar = !!((cot.permisosPortalModificacion && cot.permisosPortalModificacion.includes(req.cliente._id.toString())) || _pc.editar);
         res.json({ ...cot.toObject(), puedeModificar });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -3953,7 +3970,7 @@ app.get('/api/clientes/mis-proyectos', authCliente, async (req, res) => {
     try {
         const query = req.cliente.isAdmin
             ? {}
-            : { accesosPortal: req.cliente._id.toString() };
+            : await app.locals.portalCuentas.queryProyectos(req.cliente);
         const proyectos = await CRMProyecto.find(query)
             .select('folio nombre clienteNombre estado porcentajeAvance fechaInicio')
             .sort({ fechaInicio: -1 });
@@ -3969,7 +3986,7 @@ app.get('/api/clientes/proyectos/:id', authCliente, async (req, res) => {
         const proyecto = await CRMProyecto.findById(req.params.id);
         if (!proyecto) return res.status(404).json({ error: 'Proyecto no encontrado' });
 
-        const tieneAcceso = req.cliente.isAdmin ||
+        const tieneAcceso = req.cliente.isAdmin || await app.locals.portalCuentas.verProyecto(req.cliente, proyecto) ||
             (proyecto.accesosPortal || []).includes(req.cliente._id.toString());
         if (!tieneAcceso) {
             return res.status(403).json({ error: 'No tienes permiso para ver este panel operativo' });
@@ -4014,7 +4031,7 @@ app.post('/api/clientes/cotizaciones/:id/modificar', authCliente, async (req, re
         if (!original) return res.status(404).json({ error: 'Cotización original no encontrada' });
         
         // Verificar permiso de modificación
-        const puedeModificar = original.permisosPortalModificacion && original.permisosPortalModificacion.includes(req.cliente._id.toString());
+        const puedeModificar = !!((original.permisosPortalModificacion && original.permisosPortalModificacion.includes(req.cliente._id.toString())) || (await app.locals.portalCuentas.cotizacion(req.cliente, original, false)).editar);
         if (!puedeModificar) {
             return res.status(403).json({ error: 'No tienes permiso para modificar esta cotización' });
         }

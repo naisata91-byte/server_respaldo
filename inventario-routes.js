@@ -114,13 +114,22 @@ module.exports = function ({ app, mongoose, authCliente }) {
         const edit = !!req.cliente.isAdmin || (inv.editoresPortal || []).includes(id);
         return { ver: edit || (inv.accesosPortal || []).includes(id), editar: edit };
     };
+    // Cuentas con membresía en el cliente dueño del inventario (portal-cuentas-routes.js)
+    const PC = () => (app.locals && app.locals.portalCuentas) || { sitesCon: async () => [], nivel: async () => 0 };
+    const permisosA = async (inv, req) => {
+        const base = permisos(inv, req);
+        if (base.editar || !inv.siteId || req.cliente.isAdmin) return base;
+        const n = await PC().nivel(req.cliente, 'inventario', inv.siteId);
+        return { ver: base.ver || n >= 1, editar: n >= 2 };
+    };
     const soloAdmin = (req, res) => { if (!req.cliente.isAdmin) { res.status(403).json({ error: 'Solo el equipo de Naisata puede hacer esto' }); return false; } return true; };
     const falla = (res, e) => res.status(e.status || 500).json({ error: e.status ? e.message : 'Error en el inventario' });
 
     // Lista de inventarios a los que tengo acceso
     app.get('/api/clientes/inventarios', authCliente, async (req, res) => {
         try {
-            const q = req.cliente.isAdmin ? {} : { $or: [{ accesosPortal: miId(req) }, { editoresPortal: miId(req) }] };
+            const sitesInv = req.cliente.isAdmin ? [] : await PC().sitesCon(req.cliente, 'inventario', 'ver');
+            const q = req.cliente.isAdmin ? {} : { $or: [{ accesosPortal: miId(req) }, { editoresPortal: miId(req) }, ...(sitesInv.length ? [{ siteId: { $in: sitesInv } }] : [])] };
             const lista = await CRMInventario.find(q).select('nombre').sort({ nombre: 1 }).lean();
             res.json({ isAdmin: !!req.cliente.isAdmin, inventarios: lista.map(i => ({ _id: i._id, nombre: i.nombre })) });
         } catch (e) { falla(res, e); }
@@ -131,7 +140,7 @@ module.exports = function ({ app, mongoose, authCliente }) {
         try {
             const inv = await CRMInventario.findById(req.params.id).lean();
             if (!inv) return res.status(404).json({ error: 'Inventario no encontrado' });
-            const p = permisos(inv, req);
+            const p = await permisosA(inv, req);
             if (!p.ver) return res.status(403).json({ error: 'No tienes acceso a este inventario' });
             const out = {
                 _id: inv._id, nombre: inv.nombre, version: inv.version, canEdit: p.editar, branding: inv.branding || {},
@@ -146,9 +155,9 @@ module.exports = function ({ app, mongoose, authCliente }) {
     // Guardar (control de versión: evita que dos personas se pisen)
     app.put('/api/clientes/inventario/:id', authCliente, async (req, res) => {
         try {
-            const inv = await CRMInventario.findById(req.params.id).select('accesosPortal editoresPortal version').lean();
+            const inv = await CRMInventario.findById(req.params.id).select('accesosPortal editoresPortal version siteId').lean();
             if (!inv) return res.status(404).json({ error: 'Inventario no encontrado' });
-            if (!permisos(inv, req).editar) return res.status(403).json({ error: 'No tienes permiso para editar este inventario' });
+            if (!(await permisosA(inv, req)).editar) return res.status(403).json({ error: 'No tienes permiso para editar este inventario' });
             const datos = sanitizarInventario(req.body || {});
             const base = Number(req.body.baseVersion);
             const nuevo = await CRMInventario.findOneAndUpdate(
@@ -164,9 +173,9 @@ module.exports = function ({ app, mongoose, authCliente }) {
     // Marca del cliente (nombre, color, logo)
     app.put('/api/clientes/inventario/:id/branding', authCliente, async (req, res) => {
         try {
-            const inv = await CRMInventario.findById(req.params.id).select('accesosPortal editoresPortal').lean();
+            const inv = await CRMInventario.findById(req.params.id).select('accesosPortal editoresPortal siteId').lean();
             if (!inv) return res.status(404).json({ error: 'Inventario no encontrado' });
-            if (!permisos(inv, req).editar) return res.status(403).json({ error: 'No tienes permiso para personalizar este portal' });
+            if (!(await permisosA(inv, req)).editar) return res.status(403).json({ error: 'No tienes permiso para personalizar este portal' });
             const branding = sanitizarBranding(req.body);
             await CRMInventario.updateOne({ _id: req.params.id }, { $set: { branding } });
             res.json({ branding });
