@@ -63,7 +63,8 @@ function sanitizarInventario(body) {
             switchId: refId(p.switchId), swPuerto: num(p.swPuerto),
             nvrId: refId(p.nvrId), nvrCanal: num(p.nvrCanal),
             vlan: num(p.vlan), ip: str(p.ip, 45), mac: str(p.mac, 30), ubicacion: str(p.ubicacion, 200),
-            estado: ESTADOS.includes(p.estado) ? p.estado : 'activo', proyecto: str(p.proyecto, 60), fecha: str(p.fecha, 10)
+            estado: ESTADOS.includes(p.estado) ? p.estado : 'activo', proyecto: str(p.proyecto, 60), fecha: str(p.fecha, 10),
+            entregableId: refId(p.entregableId)
         };
     });
     return { sucursales, sites, equipos, puntos };
@@ -87,6 +88,7 @@ module.exports = function ({ app, mongoose, authCliente }) {
     const CRMInventario = mongoose.models.CRMInventario || mongoose.model('CRMInventario', new S({
         _id: { type: String, default: () => new mongoose.Types.ObjectId().toString() },
         nombre: { type: String, required: true, trim: true },
+        siteId: { type: String, index: true },   // cliente (colección "sites" del CRM) al que pertenece este inventario
         accesosPortal: [String],   // clientes con acceso de lectura
         editoresPortal: [String],  // clientes que además pueden editar
         branding: { nombre: String, color: String, logo: String },
@@ -96,7 +98,8 @@ module.exports = function ({ app, mongoose, authCliente }) {
         puntos: [{
             _id: false, id: String, nombre: String, tipo: String, sucursalId: String, siteId: String,
             patchId: String, patchPuerto: Number, switchId: String, swPuerto: Number, nvrId: String, nvrCanal: Number,
-            vlan: Number, ip: String, mac: String, ubicacion: String, estado: String, proyecto: String, fecha: String
+            vlan: Number, ip: String, mac: String, ubicacion: String, estado: String, proyecto: String, fecha: String,
+            entregableId: String   // entregable (ticket) del que salió este punto
         }],
         version: { type: Number, default: 1 },
         creadoPor: String,
@@ -207,6 +210,14 @@ module.exports = function ({ app, mongoose, authCliente }) {
             res.json({ message: 'Accesos actualizados' });
         } catch (e) { falla(res, e); }
     });
+
+    // Entregables → inventario (Gemini, "Asignarle site") y vista de entregables del portal.
+    // Si este módulo falla, el inventario sigue funcionando.
+    try {
+        require('./entregables-inventario-routes')({ app, mongoose, authCliente, CRMInventario, sanitizarInventario, str, num });
+    } catch (e) {
+        process.stderr.write('[Entregables-Inventario] Modulo no cargado: ' + (e && e.message) + '\n');
+    }
 };
 
 module.exports.sanitizarInventario = sanitizarInventario;
