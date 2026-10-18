@@ -161,7 +161,15 @@ module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitiza
     const PC = () => (app.locals && app.locals.portalCuentas) || { sitesCon: async () => [] };
     const helpers = { str, num };
     const falla = (res, e) => {
-        if (!e.status) { try { console.error('[Entregables→Inventario]', e); } catch (_) { /* sin log */ } }
+        if (!e.status) {
+            // server_2 conserva console.error en un registro interno; escribir
+            // también a stderr hace que Render muestre el origen del 500.
+            // No se entrega el detalle al portal para no exponer datos internos.
+            try {
+                const detalle = e && (e.stack || e.message) ? (e.stack || e.message) : String(e);
+                process.stderr.write(`[Entregables→Inventario] ${detalle}\n`);
+            } catch (_) { /* sin log */ }
+        }
         res.status(e.status || 500).json({ error: e.status ? e.message : 'Error en el servidor del inventario', ...(e.extra || {}) });
     };
     const idCands = id => { const v = [String(id)]; if (mongoose.Types.ObjectId.isValid(id)) v.push(new mongoose.Types.ObjectId(id)); return v; };
