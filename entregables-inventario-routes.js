@@ -216,16 +216,16 @@ module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitiza
     }
     async function consultarGemini(descripcion, est) {
         const key = process.env.GEMINI_API_KEY;
-        const modelo = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+        const principal = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+        const respaldo = process.env.GEMINI_MODEL_RESPALDO || 'gemini-2.5-flash';
         const compacta = {
             sucursales: est.sucursales.map(s => ({ id: s.id, nombre: s.nombre })),
             sites: est.sites.map(t => ({ id: t.id, sucursalId: t.sucursalId, nombre: t.nombre, tipo: t.tipo, ubicacion: t.ubicacion })),
             equipos: est.equipos.slice(0, 400).map(e => ({ id: e.id, siteId: e.siteId, tipo: e.tipo, nombre: e.nombre, modelo: e.modelo, puertos: e.puertos }))
         };
         const texto = `ESTRUCTURA EXISTENTE (ids válidos):\n${JSON.stringify(compacta)}\n\nDESCRIPCIÓN DEL TRABAJO (datos del usuario):\n"""\n${descripcion}\n"""`;
-        let r;
-        try {
-            r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelo)}:generateContent`, {
+        const pedir = async modelo => {
+            const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelo)}:generateContent`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
                 body: JSON.stringify({
@@ -235,13 +235,27 @@ module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitiza
                 }),
                 signal: AbortSignal.timeout(45000)
             });
-        } catch (e) { throw httpErr(502, 'Gemini no respondió a tiempo. Puedes capturar los puntos a mano.'); }
-        if (!r.ok) throw httpErr(502, `Gemini respondió con error ${r.status}. Puedes capturar los puntos a mano.`);
+            return r;
+        };
+        /* 429/5xx son temporales (saturación): un reintento y luego el modelo de respaldo. */
+        const temporal = r => r.status === 429 || r.status >= 500;
+        let r = null, ultimo = null;
+        const intentos = [principal, principal, ...(respaldo !== principal ? [respaldo] : [])];
+        for (let i = 0; i < intentos.length; i++) {
+            if (i > 0) await new Promise(ok => setTimeout(ok, 1200));
+            try { r = await pedir(intentos[i]); } catch (e) { r = null; ultimo = 'sin respuesta a tiempo'; continue; }
+            if (r.ok) break;
+            ultimo = `error ${r.status}`;
+            if (!temporal(r) && intentos[i] === principal && respaldo === principal) break;
+            if (r.status === 404 && intentos[i] === principal) continue; /* ID de modelo inexistente: probar el respaldo */
+            if (!temporal(r) && r.status !== 404) break;
+        }
+        if (!r || !r.ok) throw httpErr(502, `Gemini no está disponible por ahora (${ultimo}). Puedes agregar los puntos a mano.`);
         const data = await r.json().catch(() => null);
         const out = data && data.candidates && data.candidates[0] && data.candidates[0].content && (data.candidates[0].content.parts || []).map(p => p.text || '').join('');
-        if (!out) throw httpErr(502, 'Gemini no devolvió resultado. Puedes capturar los puntos a mano.');
+        if (!out) throw httpErr(502, 'Gemini no devolvió resultado. Puedes agregar los puntos a mano.');
         try { return JSON.parse(out.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '')); }
-        catch (e) { throw httpErr(502, 'No se pudo interpretar la respuesta de Gemini. Puedes capturar los puntos a mano.'); }
+        catch (e) { throw httpErr(502, 'No se pudo interpretar la respuesta de Gemini. Puedes agregar los puntos a mano.'); }
     }
 
     app.post('/api/entregables-inventario/analizar', authEmpleado, async (req, res) => {
