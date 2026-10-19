@@ -529,13 +529,31 @@ module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitiza
     app.get('/api/clientes/mis-entregables', authCliente, async (req, res) => {
         try {
             const a = await alcance(req);
-            // No usar una agregación aquí: instalaciones anteriores de MongoDB
-            // fallaban al evaluar $strLenCP/$toString sobre entregables antiguos
-            // con campos heterogéneos. La conversión en JavaScript es segura y
-            // mantiene la respuesta del portal estable para esos registros.
-            const lista = await tickets().find(filtroAlcance(a), {
-                projection: { folio: 1, titulo: 1, nombreTrabajo: 1, descripcion: 1, estado: 1, createdAt: 1, fechaFirma: 1, nombreCliente: 1, firmaCliente: 1, fotos: 1 }
-            }).sort({ createdAt: -1, _id: -1 }).limit(300).toArray();
+            const filtro = filtroAlcance(a);
+
+            // Proyección optimizada antes del ordenamiento para NO cargar el arreglo masivo
+            // de fotos en Base64 en la memoria del sort (evita el error 292 de MongoDB: Sort exceeded memory limit).
+            let lista = [];
+            try {
+                lista = await tickets().aggregate([
+                    { $match: filtro },
+                    {
+                        $project: {
+                            folio: 1, titulo: 1, nombreTrabajo: 1, descripcion: 1, estado: 1,
+                            createdAt: 1, fechaFirma: 1, nombreCliente: 1, firmaCliente: 1,
+                            nFotos: { $size: { $ifNull: ['$fotos', []] } }
+                        }
+                    },
+                    { $sort: { createdAt: -1, _id: -1 } },
+                    { $limit: 300 }
+                ]).toArray();
+            } catch (errAgg) {
+                // Respaldo seguro por find() excluyendo fotos
+                lista = await tickets().find(filtro, {
+                    projection: { folio: 1, titulo: 1, nombreTrabajo: 1, descripcion: 1, estado: 1, createdAt: 1, fechaFirma: 1, nombreCliente: 1, firmaCliente: 1, fotos: { $slice: 0 } }
+                }).sort({ createdAt: -1, _id: -1 }).limit(300).toArray();
+            }
+
             res.json(lista.map(t => ({
                 id: String(t._id),
                 folio: t.folio || '',
@@ -546,32 +564,40 @@ module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitiza
                 fechaFirma: t.fechaFirma || null,
                 nombreCliente: t.nombreCliente || '',
                 firmado: typeof t.firmaCliente === 'string' && t.firmaCliente.length > 0,
-                nFotos: Array.isArray(t.fotos) ? t.fotos.length : 0
+                nFotos: typeof t.nFotos === 'number' ? t.nFotos : (Array.isArray(t.fotos) ? t.fotos.length : 0)
             })));
         } catch (e) { falla(res, e); }
     });
 
-    async function ticketVisible(req, id) {
-        const a = await alcance(req);
-        const t = await tickets().findOne({ $and: [idFilter(id), filtroAlcance(a)] });
-        if (!t) throw httpErr(404, 'Entregable no encontrado');
-        return t;
-    }
-
     app.get('/api/clientes/entregables/:id', authCliente, async (req, res) => {
         try {
-            const t = await ticketVisible(req, req.params.id);
-            const id = String(t._id);
+            const a = await alcance(req);
+            const id = req.params.id;
+            // Consultar datos del entregable sin cargar las fotos pesadas de golpe
+            const pipeline = [
+                { $match: { $and: [idFilter(id), filtroAlcance(a)] } },
+                {
+                    $project: {
+                        folio: 1, titulo: 1, nombreTrabajo: 1, descripcion: 1, estado: 1,
+                        createdAt: 1, fechaFirma: 1, nombreCliente: 1, nombreTecnico: 1,
+                        firmaCliente: 1, nombreFirmaCliente: 1, datosActa: 1,
+                        nFotos: { $size: { $ifNull: ['$fotos', []] } }
+                    }
+                }
+            ];
+            const [t] = await tickets().aggregate(pipeline).toArray();
+            if (!t) return res.status(404).json({ error: 'Entregable no encontrado' });
+
             const acta = t.datosActa && typeof t.datosActa === 'object' ? t.datosActa : {};
             const datosActa = {};
             DATOS_ACTA_PUBLICOS.forEach(k => { if (typeof acta[k] === 'string' && acta[k]) datosActa[k] = acta[k]; });
             const yo = String(req.cliente._id);
-            const invs = await CRMInventario.find({ 'puntos.entregableId': id }).lean();
+            const invs = await CRMInventario.find({ 'puntos.entregableId': String(t._id) }).lean();
             const sitesInv = await PC().sitesCon(req.cliente, 'inventario', 'ver');
             const puntos = [];
             invs.filter(i => req.cliente.isAdmin || (i.accesosPortal || []).includes(yo) || (i.editoresPortal || []).includes(yo) || (i.siteId && sitesInv.includes(String(i.siteId)))).forEach(i => {
                 const eq = x => (i.equipos || []).find(e => e.id === x) || {};
-                (i.puntos || []).filter(p => p.entregableId === id).forEach(p => puntos.push({
+                (i.puntos || []).filter(p => p.entregableId === String(t._id)).forEach(p => puntos.push({
                     nombre: p.nombre, tipo: p.tipo, estado: p.estado, ubicacion: p.ubicacion || '', ip: p.ip || '',
                     sucursal: ((i.sucursales || []).find(s => s.id === p.sucursalId) || {}).nombre || '',
                     site: ((i.sites || []).find(s => s.id === p.siteId) || {}).nombre || '',
@@ -581,10 +607,10 @@ module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitiza
                 }));
             });
             res.json({
-                id, folio: t.folio || '', titulo: t.titulo || t.nombreTrabajo || '', descripcion: t.descripcion || '', estado: t.estado || '',
+                id: String(t._id), folio: t.folio || '', titulo: t.titulo || t.nombreTrabajo || '', descripcion: t.descripcion || '', estado: t.estado || '',
                 createdAt: t.createdAt, fechaFirma: t.fechaFirma || null, nombreCliente: t.nombreCliente || '', nombreTecnico: t.nombreTecnico || '',
                 firmado: typeof t.firmaCliente === 'string' && t.firmaCliente.length > 0, nombreFirmaCliente: t.nombreFirmaCliente || '',
-                nFotos: Array.isArray(t.fotos) ? t.fotos.length : 0, datosActa,
+                nFotos: typeof t.nFotos === 'number' ? t.nFotos : 0, datosActa,
                 fotosInfo: Array.isArray(acta.fotosInfo) ? acta.fotosInfo.map(f => ({ descripcion: String(f && f.descripcion || ''), fecha: String(f && f.fecha || ''), ubicacion: String(f && f.ubicacion || '') })) : [],
                 puntos
             });
@@ -593,11 +619,17 @@ module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitiza
 
     app.get('/api/clientes/entregables/:id/foto/:i', authCliente, async (req, res) => {
         try {
-            const t = await ticketVisible(req, req.params.id);
+            const a = await alcance(req);
             const i = Number.parseInt(req.params.i, 10);
+            if (!Number.isInteger(i) || i < 0) throw httpErr(404, 'Foto no encontrada');
+            // Cargar con $slice estrictamente LA ÚNICA FOTO solicitada
+            const t = await tickets().findOne(
+                { $and: [idFilter(req.params.id), filtroAlcance(a)] },
+                { projection: { fotos: { $slice: [i, 1] } } }
+            );
+            if (!t) throw httpErr(404, 'Entregable no encontrado');
             const fotos = Array.isArray(t.fotos) ? t.fotos : [];
-            if (!Number.isInteger(i) || i < 0 || i >= fotos.length) throw httpErr(404, 'Foto no encontrada');
-            const src = String(fotos[i] || '');
+            const src = String(fotos[0] || '');
             if (!/^data:image\/(png|jpe?g|webp|gif);base64,/.test(src)) throw httpErr(404, 'Foto no disponible');
             res.set('Cache-Control', 'private, max-age=300').json({ src });
         } catch (e) { falla(res, e); }
