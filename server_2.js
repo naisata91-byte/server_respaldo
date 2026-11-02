@@ -1,3 +1,7 @@
+// Configurar DNS de Google y Cloudflare en Node para resolver SRV de MongoDB Atlas sin problemas
+const dns = require('dns');
+dns.setServers(['8.8.8.8', '8.8.4.4', '1.1.1.1']);
+
 require('dotenv').config();
 
 // Registro de diagnóstico en memoria
@@ -567,7 +571,9 @@ const CRMProyectoSchema = new mongoose.Schema({
         fotos: [String]
     }],
     archivos: [String], // IDs de documentos CRMArchivo en MongoDB
-    accesosPortal: [String] // IDs de clientes con acceso de solo lectura al panel operativo
+    accesosPortal: [String], // IDs de clientes con acceso de solo lectura al panel operativo
+    // Auditoría: se llena cuando el cierre se forzó saltando los candados de seguridad
+    cierreForzado: { por: String, fecha: Date, pendientes: [String] }
 });
 const CRMProyecto = mongoose.model('CRMProyecto', CRMProyectoSchema);
 
@@ -1952,12 +1958,29 @@ app.put('/api/proyectos/:id', async (req, res) => {
             const validacion = await obtenerValidacionCierre(proyecto);
             if (!validacion.puedeCerrar) {
                 const pendientes = validacion.requisitos.filter(requisito => !requisito.completo).map(requisito => requisito.etiqueta);
-                return res.status(422).json({
-                    error: `No se puede cerrar el proyecto "${proyecto.folio || id}". Pendiente: ${pendientes.join(', ')}.`,
-                    validacion
-                });
+                // Cierre forzado: solo jonathan@naisata.com, verificado en el servidor con su token de sesión.
+                let autorizado = false;
+                if (data.forzarCierre === true) {
+                    const userId = String(req.get('x-crm-user-id') || '').trim();
+                    const token = String(req.get('x-crm-token') || '').trim();
+                    if (userId && token && userId.length <= 100) {
+                        const usuario = await UserRef.findOne({ _id: userId, tokenCrm: token }).select('correo').lean();
+                        autorizado = !!usuario && String(usuario.correo || '').trim().toLowerCase() === 'jonathan@naisata.com';
+                    }
+                    if (!autorizado) {
+                        return res.status(403).json({ error: 'Solo jonathan@naisata.com puede cerrar proyectos sin cumplir los requisitos de seguridad.', validacion });
+                    }
+                }
+                if (!autorizado) {
+                    return res.status(422).json({
+                        error: `No se puede cerrar el proyecto "${proyecto.folio || id}". Pendiente: ${pendientes.join(', ')}.`,
+                        validacion
+                    });
+                }
+                data.cierreForzado = { por: 'jonathan@naisata.com', fecha: new Date(), pendientes };
             }
         }
+        delete data.forzarCierre;
 
         const updatedProy = await CRMProyecto.findByIdAndUpdate(id, data, { returnDocument: 'after' });
         if (!updatedProy) return res.status(404).json({ error: 'Proyecto no encontrado' });
