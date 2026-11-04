@@ -635,6 +635,12 @@ module.exports = function ({ app, mongoose, authCliente, CRMInventario, sanitiza
             res.set('Cache-Control', 'private, max-age=300').json({ src });
         } catch (e) { falla(res, e); }
     });
+
+    try {
+        require('./memoria-tecnica-routes')({ app, authEmpleado, httpErr, limitar, falla, buscarInventario, estructuraDe });
+    } catch (e) {
+        process.stderr.write('[Memoria-Tecnica] Modulo no cargado: ' + (e && e.message) + '\n');
+    }
 };
 
 module.exports.normalizarPropuesta = normalizarPropuesta;
