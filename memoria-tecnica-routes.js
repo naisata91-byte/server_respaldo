@@ -17,16 +17,16 @@
 
 const TIPOS_EQ = ['switch', 'patch', 'nvr'];
 const TIPOS_DISP = ['Access Point', 'Cámara', 'Teléfono IP', 'Lector de acceso', 'PC / Estación', 'Impresora', 'Otro'];
-const TAM = { switch: [8, 16, 24, 48, 96], patch: [12, 24, 48, 96], nvr: [4, 8, 16, 32, 64] };
+const TAM = { switch: [4, 5, 8, 10, 12, 16, 24, 48, 96], patch: [12, 24, 48, 96], nvr: [4, 8, 16, 32, 64] };
 
 const PROMPT_MEMORIA = `Eres ingeniero de redes y redactas la MEMORIA TÉCNICA de un trabajo de instalación a partir de los datos del entregable (descripción, proyecto, cotización, observaciones, pies de foto).
 Responde SOLO con un JSON válido con esta forma exacta:
 {"suficiente":true,"resumen":"","equipos":[{"id":"e1","tipo":"switch|patch|nvr","nombre":"","marca":"","modelo":"","puertos":null,"ubicacion":""}],"dispositivos":[{"id":"d1","nombre":"","tipo":"","ubicacion":""}],"enlaces":[{"desdeTipo":"equipo|dispositivo","desde":"e1","desdePuerto":null,"haciaTipo":"equipo|dispositivo","hacia":"e2","haciaPuerto":null,"medio":""}],"faltantes":[""]}
 Reglas:
-- "equipos": solo switch ("switch"), patch panel ("patch") o NVR ("nvr") que la descripción mencione. "nombre" tal como lo llama la descripción (ej. "Panel C", "SW Cisco Almacén"). "marca"/"modelo" solo si se dicen. "puertos" = cantidad total de puertos/canales SOLO si la descripción (o la ESTRUCTURA EXISTENTE con ese equipo) lo dice; si no, null. Nunca inventes.
+- "equipos": solo switch ("switch"), patch panel ("patch") o NVR ("nvr") que la descripción mencione. "nombre" tal como lo llama la descripción (ej. "Panel C", "SW Cisco Almacén"). "marca"/"modelo" solo si se dicen. "puertos" = número EXACTO de puertos/canales del equipo si la descripción lo menciona (ej: "switch de 24 puertos" → 24, "panel de 24p" → 24, "SW Huawei de 24 puertos" → 24, "switch 8p" → 8). Solo pon null si REALMENTE no se menciona ninguna cantidad. Un switch de 4, 5, 6, 7 u 8 puertos es un switch de escritorio; respeta ese tamaño exacto. Nunca inventes ni redondees hacia arriba sin razón.
 - "dispositivos": equipos finales instalados (access point, cámara, teléfono, lector, PC...). Si dice "3 AP en almacén", crea 3 dispositivos con nombres como "AP Almacén 1", "AP Almacén 2", "AP Almacén 3". "tipo" exactamente uno de: ${TIPOS_DISP.join(' | ')}.
 - "enlaces": cada cable punto a punto. "desde"/"hacia" son ids de equipos o dispositivos que tú definiste arriba. Un dispositivo final no tiene puerto (puerto null). Si la descripción dice que los AP llegaron al panel en los puertos 12, 13 y 20, crea un enlace por AP: desde el dispositivo hacia el panel con haciaPuerto 12, 13 y 20. Si dice "puerto 12 del panel al 15 del switch", crea un enlace desde el panel (desdePuerto 12) hacia el switch (haciaPuerto 15). Respeta el orden y los números EXACTOS mencionados.
-- "medio": "UTP Cat6", "UTP Cat5e", "Fibra", etc. solo si se menciona; si no, "".
+- "medio": "UTP Cat6", "UTP Cat5e", "Fibra OM3", "Fibra Monomodo", etc. solo si se menciona; si no, "". Si un enlace usa fibra óptica (se mencionan palabras como fibra, SFP, LC, SC, monomodo, multimodo, OM1, OM2, OM3, OS1, OS2), pon "medio":"Fibra" (o el tipo específico si se dice) Y agrega el campo "puertoFibra":true en ese enlace.
 - Usa la ESTRUCTURA EXISTENTE (si viene) únicamente para completar cantidad de puertos/modelo de un equipo con nombre claramente igual; no agregues equipos que la descripción no menciona.
 - "resumen": 2 a 4 oraciones en español técnico que expliquen qué se instaló y cómo quedó conectado, usando solo datos presentes.
 - "suficiente": true solo si hay al menos un equipo (switch/patch/nvr) y al menos un enlace con número de puerto o canal. Si no, false.
@@ -64,7 +64,7 @@ function normalizarTopologia(raw) {
         enlaces.push({
             desde: a.x.id, desdeClase: a.clase, desdePuerto: a.clase === 'equipo' ? num(l.desdePuerto) : null,
             hacia: b.x.id, haciaClase: b.clase, haciaPuerto: b.clase === 'equipo' ? num(l.haciaPuerto) : null,
-            medio: str(l.medio, 30)
+            medio: str(l.medio, 30), puertoFibra: l.puertoFibra === true || /fibra|sfp|lc\b|sc\b|monomodo|multimodo|om[123]|os[12]/i.test(str(l.medio, 30))
         });
     });
     /* Tamaño de cada equipo: el dicho, o el estándar más chico que contenga el puerto más alto usado. */
@@ -80,7 +80,7 @@ function normalizarTopologia(raw) {
             e.puertos = TAM[e.tipo].find(n => n >= max) || Math.ceil(max / 8) * 8;
         }
         if (!e.puertos) {
-            e.puertos = TAM[e.tipo].find(n => n >= Math.max(max, e.tipo === 'patch' ? 24 : e.tipo === 'nvr' ? 16 : 24)) || Math.ceil(max / 8) * 8;
+            e.puertos = TAM[e.tipo].find(n => n >= Math.max(max, e.tipo === 'patch' ? 12 : e.tipo === 'nvr' ? 4 : 1)) || Math.ceil(max / 8) * 8;
             e.puertosEstimados = true;
         }
     });
