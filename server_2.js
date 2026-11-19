@@ -1435,7 +1435,7 @@ app.post('/api/finanzas/config-empleados/:id', async (req, res) => {
 // Rutas de Cotizaciones
 app.get('/api/cotizaciones', async (req, res) => {
     try {
-        const cots = await CRMCotizacion.find({ esBorrador: { $ne: true } }).sort({ fechaCreacion: -1 });
+        const cots = await CRMCotizacion.find({ esBorrador: { $ne: true } }).sort({ fechaCreacion: -1 }).lean();
         res.json(cots);
     } catch(err) { res.status(500).json({error: err.message}); }
 });
