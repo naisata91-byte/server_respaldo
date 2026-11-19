@@ -277,6 +277,52 @@ app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Idempotencia para escrituras críticas. Si el navegador pierde la respuesta
+// después de que MongoDB guardó el documento, puede repetir la petición con la
+// misma clave sin crear un segundo registro.
+const idempotencyEntries = new Map();
+const idempotencyMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+const idempotencyTtlMs = 10 * 60 * 1000;
+function replayIdempotentResponse(res, entry) {
+    res.status(entry.status || 200);
+    if (entry.json) return res.json(entry.body);
+    return res.send(entry.body);
+}
+app.use((req, res, next) => {
+    if (!idempotencyMethods.has(req.method)) return next();
+    const key = String(req.get('Idempotency-Key') || '').trim();
+    if (!key || key.length > 200) return next();
+
+    const actor = String(req.get('x-crm-user-id') || req.get('x-user-id') || req.ip || 'anon').slice(0, 120);
+    const cacheKey = `${actor}:${req.method}:${req.originalUrl}:${key}`;
+    const previous = idempotencyEntries.get(cacheKey);
+    if (previous) {
+        if (previous.pending) return res.status(409).json({ error: 'Esta operación ya está en proceso. Espera la confirmación.' });
+        return replayIdempotentResponse(res, previous);
+    }
+
+    const entry = { pending: true, status: 200, json: false, body: null };
+    idempotencyEntries.set(cacheKey, entry);
+    const remember = body => {
+        if (!entry.pending) return;
+        entry.pending = false;
+        entry.status = res.statusCode || 200;
+        entry.body = body;
+        entry.json = body !== null && typeof body === 'object' && !Buffer.isBuffer(body);
+        if (entry.status < 200 || entry.status >= 300) {
+            idempotencyEntries.delete(cacheKey);
+            return;
+        }
+        setTimeout(() => idempotencyEntries.delete(cacheKey), idempotencyTtlMs).unref?.();
+    };
+    const originalJson = res.json.bind(res);
+    const originalSend = res.send.bind(res);
+    res.json = body => { remember(body); return originalJson(body); };
+    res.send = body => { remember(body); return originalSend(body); };
+    res.on('finish', () => { if (entry.pending) remember(null); });
+    next();
+});
+
 // MongoDB Connection
 // Render puede sobrescribirla con MONGODB_URI. El valor de respaldo permite
 // iniciar el CRM aun cuando la variable todavía no se haya configurado allí.
