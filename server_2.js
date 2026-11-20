@@ -473,6 +473,10 @@ const CRMCotizacionSchema = new mongoose.Schema({
     cotizacionOriginalId: String, // Referencia a la original si esta es copia modificada
     esModificadaPorCliente: { type: Boolean, default: false }, // Bandera de si fue hecha por cliente
     esBorrador: { type: Boolean, default: false },
+    // Identidad estable de un alta iniciada en una PC. Permite reconocer el
+    // mismo POST cuando la respuesta se pierde y se reenvía desde la cola
+    // offline, aun si el servidor se reinició entre ambos intentos.
+    offlineOperationId: { type: String, unique: true, sparse: true },
     revision: { type: Number, default: 0 },
     colaboracionActualizadaEn: Date
 });
@@ -1554,9 +1558,28 @@ function normalizarFechaCotizacion(valor) {
 }
 
 app.post('/api/cotizaciones', async (req, res) => {
+    let offlineOperationId = '';
     try {
         const data = req.body;
         const actor = actorCotizacion(req);
+        offlineOperationId = String(req.get('x-offline-operation-id') || data?._offlineOperationId || '').trim().slice(0, 200);
+
+        // Primero consultar la identidad persistente. La caché HTTP de
+        // idempotencia protege el caso inmediato; este respaldo cubre una
+        // reconexión tardía o un reinicio del servidor.
+        if (offlineOperationId) {
+            const existente = await CRMCotizacion.findOne({ offlineOperationId });
+            if (existente) {
+                return res.json({
+                    message: 'Cotización ya registrada; se reutilizó la operación original.',
+                    data: existente,
+                    folioReasignado: false,
+                    folioAnterior: existente.folio,
+                    folioNuevo: existente.folio
+                });
+            }
+            data.offlineOperationId = offlineOperationId;
+        }
 
         // 1. El servidor reemplaza cualquier ID creado offline y cualquier
         // colisión por una identidad nueva y canónica.
@@ -1624,6 +1647,13 @@ app.post('/api/cotizaciones', async (req, res) => {
             idProvisional
         });
     } catch(err) {
+        // Dos reintentos simultáneos de la misma operación pueden ganar la
+        // consulta anterior a la vez. El índice único decide y devolvemos el
+        // documento ya creado en lugar de reportar un falso error o duplicar.
+        if (offlineOperationId && err?.code === 11000 && /offlineOperationId/i.test(String(err?.message || ''))) {
+            const existente = await CRMCotizacion.findOne({ offlineOperationId });
+            if (existente) return res.json({ message: 'Cotización ya registrada.', data: existente, folioNuevo: existente.folio });
+        }
         res.status(500).json({error: err.message});
     }
 });
@@ -4016,7 +4046,7 @@ try {
 
 // Inventario de red del portal de clientes (modulo aparte: inventario-routes.js)
 try {
-    require('./inventario-routes')({ app, mongoose, authCliente });
+    require('./inventario-routes')({ app, mongoose, authCliente, CRMArchivo });
 } catch (e) {
     // Si falta o falla el modulo, el servidor NO debe dejar de arrancar.
     process.stderr.write('[Inventario] Modulo no cargado: ' + (e && e.message) + '\n');
