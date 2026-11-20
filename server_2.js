@@ -478,6 +478,26 @@ const CRMCotizacionSchema = new mongoose.Schema({
 });
 const CRMCotizacion = mongoose.model('CRMCotizacion', CRMCotizacionSchema);
 
+// Los clientes offline usan un ID temporal sólo para poder trabajar sin red.
+// La nube es la única autoridad para emitir IDs persistentes: al recibir una
+// sincronización reemplazamos siempre ese ID, incluso si por casualidad no
+// colisiona todavía.  Así nunca se mezclan registros de dos computadoras.
+async function prepararIdParaCrear(Model, data, req) {
+    const recibido = data && (data._id || data.id);
+    if (!recibido) return null;
+    const idProvisional = String(recibido);
+    const esSyncOffline = req?.headers?.['x-offline-sync'] === 'true'
+        || Boolean(data?._provieneDeOffline || data?._offlineModified)
+        || /^(offline_|local_)/i.test(idProvisional);
+
+    if (esSyncOffline || await Model.exists({ _id: idProvisional })) {
+        delete data._id;
+        delete data.id;
+        return idProvisional;
+    }
+    return null;
+}
+
 // ─── Colaboración de cotizaciones ──────────────────────────────────────────
 // Las partidas y productos se modifican como renglones independientes. Así un
 // cambio de CCTV no reemplaza el arreglo que otro usuario está editando.
@@ -572,6 +592,34 @@ async function generarFolioAutomatico() {
         if (!(await CRMCotizacion.findOne({ folio }))) break;
     }
     return folio;
+}
+
+function esDuplicadoDeFolio(error) {
+    return error?.code === 11000 && (
+        error?.keyPattern?.folio || /folio/i.test(String(error?.message || ''))
+    );
+}
+
+// El índice único de MongoDB es el árbitro final ante dos usuarios que piden
+// folio al mismo tiempo. Si otro proceso tomó el candidato, se vuelve a pedir
+// uno hasta guardar uno realmente libre.
+async function guardarCotizacionConFolioSeguro(data) {
+    let lastError;
+    let folioReasignado = false;
+    for (let intento = 0; intento < 20; intento++) {
+        const cotizacion = new CRMCotizacion({ ...data, revision: 1, colaboracionActualizadaEn: new Date() });
+        recalcularCotizacion(cotizacion);
+        try {
+            await cotizacion.save();
+            return { cotizacion, folioReasignado };
+        } catch (error) {
+            lastError = error;
+            if (!esDuplicadoDeFolio(error) || data.esBorrador === true) throw error;
+            data.folio = await generarFolioAutomatico();
+            folioReasignado = true;
+        }
+    }
+    throw lastError || new Error('No se pudo reservar un folio único');
 }
 
 const CRMProyectoSchema = new mongoose.Schema({
@@ -1509,16 +1557,35 @@ app.post('/api/cotizaciones', async (req, res) => {
     try {
         const data = req.body;
         const actor = actorCotizacion(req);
-        data.partidas = (Array.isArray(data.partidas) ? data.partidas : []).map(linea => payloadLinea('partidas', linea, actor));
-        data.productosSugeridos = (Array.isArray(data.productosSugeridos) ? data.productosSugeridos : []).map(linea => payloadLinea('productosSugeridos', linea, actor));
+
+        // 1. El servidor reemplaza cualquier ID creado offline y cualquier
+        // colisión por una identidad nueva y canónica.
+        const idProvisional = await prepararIdParaCrear(CRMCotizacion, data, req);
+
+        // 2. Normalización de partidas y productos sugeridos con lineaId únicos (sin colisiones)
+        const idsUsados = new Set();
+        data.partidas = (Array.isArray(data.partidas) ? data.partidas : []).map(linea => {
+            const p = payloadLinea('partidas', linea, actor);
+            if (idsUsados.has(p.lineaId)) p.lineaId = nuevaLineaId();
+            idsUsados.add(p.lineaId);
+            return p;
+        });
+        data.productosSugeridos = (Array.isArray(data.productosSugeridos) ? data.productosSugeridos : []).map(linea => {
+            const p = payloadLinea('productosSugeridos', linea, actor);
+            if (idsUsados.has(p.lineaId)) p.lineaId = nuevaLineaId();
+            idsUsados.add(p.lineaId);
+            return p;
+        });
+
         // Un borrador colaborativo no crea catálogos por el simple hecho de
         // teclear. El cliente nuevo se registra únicamente al confirmar la
         // cotización.
         const clienteResultado = data.esBorrador === true ? null : await asegurarClienteCotizacion(data);
 
-        // Un BORRADOR no consume folio: el folio (manual o automático) se asigna
-        // hasta que se confirma con Guardar. Así cancelar no deja cotizaciones
-        // fantasma ni huecos en la numeración.
+        // 3. SEGURO INTELIGENTE DE FOLIOS (Resolución de colisiones offline / online)
+        let folioReasignado = false;
+        let folioOriginal = data.folio;
+
         if (data.esBorrador === true) {
             delete data.folio;
         } else {
@@ -1526,9 +1593,15 @@ app.post('/api/cotizaciones', async (req, res) => {
             if (folioManual) {
                 const existe = await CRMCotizacion.findOne({ folio: data.folio.trim() });
                 if (existe) {
-                    return res.status(409).json({ error: `El folio "${data.folio.trim()}" ya está en uso. Elige otro o usa asignación automática.` });
+                    // Si ya existe en el servidor:
+                    // En lugar de fallar con 409, asignar automáticamente el siguiente folio disponible libre
+                    folioOriginal = data.folio.trim();
+                    data.folio = await generarFolioAutomatico();
+                    folioReasignado = true;
+                    console.log(`[OfflineReconciliation] Conflicto resuelto: folio ${folioOriginal} ya existía en la nube. Reasignado nuevo folio disponible: ${data.folio}`);
+                } else {
+                    data.folio = data.folio.trim();
                 }
-                data.folio = data.folio.trim();
             } else {
                 data.folio = await generarFolioAutomatico();
             }
@@ -1536,22 +1609,25 @@ app.post('/api/cotizaciones', async (req, res) => {
 
         const fechaNueva = normalizarFechaCotizacion(data.fechaCreacion);
         if (fechaNueva) data.fechaCreacion = fechaNueva; else delete data.fechaCreacion;
-        const newCotizacion = new CRMCotizacion({ ...data, revision: 1, colaboracionActualizadaEn: new Date() });
-        recalcularCotizacion(newCotizacion);
-        await newCotizacion.save();
+        const resultadoGuardado = await guardarCotizacionConFolioSeguro(data);
+        const newCotizacion = resultadoGuardado.cotizacion;
+        folioReasignado = folioReasignado || resultadoGuardado.folioReasignado;
         if (!newCotizacion.esBorrador) { try { if (global.io) global.io.emit('cotizacion_creada', newCotizacion); } catch(_) {} }
-        res.json({ message: 'Cotización creada con éxito', data: newCotizacion, cliente: clienteResultado?.cliente || null, clienteCreado: Boolean(clienteResultado?.creado) });
+        res.json({
+            message: folioReasignado ? `Cotización sincronizada con éxito (folio reasignado a ${newCotizacion.folio})` : 'Cotización creada con éxito',
+            data: newCotizacion,
+            cliente: clienteResultado?.cliente || null,
+            clienteCreado: Boolean(clienteResultado?.creado),
+            folioReasignado,
+            folioAnterior: folioOriginal,
+            folioNuevo: newCotizacion.folio,
+            idProvisional
+        });
     } catch(err) {
-        if (err.code === 11000) {
-            // Error de índice único en MongoDB (race condition extrema)
-            return res.status(409).json({ error: 'El folio generado ya existe. Por favor intenta de nuevo.' });
-        }
         res.status(500).json({error: err.message});
     }
 });
 
-// Actualiza exclusivamente campos generales. Las partidas y productos usan sus
-// propias rutas para que nunca se pisen entre usuarios.
 app.patch('/api/cotizaciones/:id/campos', async (req, res) => {
     try {
         const permitidos = ['clienteId', 'clienteNombre', 'descripcion', 'lugarEjecucion', 'contacto', 'categoria', 'condiciones', 'notas', 'estado', 'fechaSeguimiento', 'fechaCreacion', 'requiereRevision', 'esBorrador', 'folio', 'archivos'];
@@ -1698,18 +1774,46 @@ app.put('/api/cotizaciones/:id', async (req, res) => {
     try {
         const { id } = req.params;
         const data = req.body;
-        const anterior = await CRMCotizacion.findById(id);
-        if (!anterior) return res.status(404).json({ error: 'Cotización no encontrada' });
+        const esSyncOffline = req.headers['x-offline-sync'] === 'true' || Boolean(data._provieneDeOffline || data._offlineModified);
+
+        let anterior = await CRMCotizacion.findById(id);
+
+        // Si la cotización no existe por ese ID (por ejemplo se creó offline con un ID provisional "offline_...")
+        if (!anterior) {
+            if (esSyncOffline || String(id).startsWith('offline_') || String(id).startsWith('local_')) {
+                delete data._id;
+                // Si el folio choca con una existente, asignar uno libre
+                if (data.folio) {
+                    const choca = await CRMCotizacion.findOne({ folio: data.folio });
+                    if (choca) {
+                        data.folio = await generarFolioAutomatico();
+                    }
+                } else {
+                    data.folio = await generarFolioAutomatico();
+                }
+                const newCot = new CRMCotizacion({ ...data, revision: 1, colaboracionActualizadaEn: new Date() });
+                recalcularCotizacion(newCot);
+                await newCot.save();
+                if (global.io) global.io.emit('cotizacion_creada', newCot);
+                return res.json({ message: 'Cotización offline sincronizada exitosamente', data: newCot, folioReasignado: true, folioNuevo: newCot.folio, idProvisional: id });
+            }
+            return res.status(404).json({ error: 'Cotización no encontrada' });
+        }
+
         const clienteResultado = data.esBorrador === true ? null : await asegurarClienteCotizacion(data);
 
         // Compatibilidad para clientes que aún usan PUT completo: los nuevos
         // renglones reciben identidad/autor y los existentes conservan la suya.
+        const idsUsados = new Set();
         ['partidas', 'productosSugeridos'].forEach(campo => {
             if (!Array.isArray(data[campo])) return;
             const previas = anterior[campo] || [];
             data[campo] = data[campo].map((linea, index) => {
                 const previa = previas.find(item => item.lineaId && item.lineaId === linea.lineaId) || previas[index] || {};
-                return payloadLinea(campo, linea, actorCotizacion(req), previa);
+                const p = payloadLinea(campo, linea, actorCotizacion(req), previa);
+                if (idsUsados.has(p.lineaId)) p.lineaId = nuevaLineaId();
+                idsUsados.add(p.lineaId);
+                return p;
             });
         });
         if (Array.isArray(data.partidas)) {
@@ -1722,6 +1826,13 @@ app.put('/api/cotizaciones/:id', async (req, res) => {
         // Prevent overwriting the folio with an empty string or default labels which trigger duplicate key E11000
         if (data.folio === '' || data.folio === 'Asignación Automática' || data.folio === 'Sin folio') {
             delete data.folio;
+        } else if (data.folio && data.folio !== anterior.folio) {
+            // Si el folio que trae colisiona con otra cotización existente diferente
+            const folioOcupado = await CRMCotizacion.findOne({ folio: data.folio, _id: { $ne: id } });
+            if (folioOcupado) {
+                console.log(`[OfflineReconciliation] En PUT: folio ${data.folio} ya ocupado por otra cotización. Conservando folio original ${anterior.folio}`);
+                data.folio = anterior.folio;
+            }
         }
 
         if (Object.prototype.hasOwnProperty.call(data, 'fechaCreacion')) {
@@ -1747,7 +1858,6 @@ app.put('/api/cotizaciones/:id', async (req, res) => {
     }
 });
 
-// Cancelar venta de una cotización (Ganada -> Cancelada) y eliminar su Panel Operativo
 app.post('/api/cotizaciones/:id/cancelar-venta', async (req, res) => {
     try {
         const { id } = req.params;
@@ -1895,8 +2005,9 @@ app.get('/api/proyectos', async (req, res) => {
 app.post('/api/proyectos', async (req, res) => {
     try {
         const data = req.body;
+        const idProvisional = await prepararIdParaCrear(CRMProyecto, data, req);
+
         const count = await CRMProyecto.countDocuments();
-        
         let folioFinal = `P${count + 1}`;
         
         // Asignar Folio heredado si existe
@@ -1915,10 +2026,18 @@ app.post('/api/proyectos', async (req, res) => {
                  }
             }
         }
+
+        // Seguro contra folios de proyecto repetidos
+        let folioCheck = await CRMProyecto.findOne({ folio: folioFinal });
+        let pIndex = 1;
+        while (folioCheck) {
+            folioFinal = `${folioFinal}-${pIndex++}`;
+            folioCheck = await CRMProyecto.findOne({ folio: folioFinal });
+        }
         
         const newProy = new CRMProyecto({ ...data, folio: folioFinal });
         await newProy.save();
-        res.json({ message: 'Proyecto creado con éxito', data: newProy });
+        res.json({ message: 'Proyecto creado con éxito', data: newProy, idProvisional });
     } catch(err) { res.status(500).json({error: err.message}); }
 });
 
@@ -2678,6 +2797,7 @@ async function notificarFlotilla(actividad, nuevosVehiculosIds) {
 app.post('/api/actividades', async (req, res) => {
     try {
         const data = req.body;
+        const idProvisional = await prepararIdParaCrear(CRMActividad, data, req);
 
         // Ajuste de zona horaria para evitar desfase de 1 día (forzar mediodía UTC)
         if (data.fechaVencimiento && typeof data.fechaVencimiento === 'string' && data.fechaVencimiento.length === 10) {
@@ -2811,7 +2931,7 @@ app.post('/api/actividades', async (req, res) => {
         }
 
         // ✅ Responder al cliente INMEDIATAMENTE (sin esperar WhatsApp)
-        res.json({ message: 'Actividad creada con éxito', data: newAct });
+        res.json({ message: 'Actividad creada con éxito', data: newAct, idProvisional });
 
         // --- NOTIFICACIONES WHATSAPP (en segundo plano, NO bloquea la respuesta) ---
         setImmediate(async () => {
@@ -3173,9 +3293,10 @@ app.get('/api/eventos', async (req, res) => {
 app.post('/api/eventos', async (req, res) => {
     try {
         const data = req.body;
+        const idProvisional = await prepararIdParaCrear(CRMEvento, data, req);
         const ev = new CRMEvento(data);
         await ev.save();
-        res.json({ message: 'Evento creado', data: ev });
+        res.json({ message: 'Evento creado', data: ev, idProvisional });
     } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
