@@ -558,7 +558,8 @@ module.exports = function ({ app, mongoose, authCliente, CRMArchivo, CRMInventar
         const or = [];
         if (a.proyIds.length || a.folios.length) or.push({ proyectoId: { $in: [...a.proyIds, ...a.folios] } }, { folio: { $in: a.folios } });
         if (a.siteIds.length) or.push({ siteId: { $in: a.siteIds } });
-        if (a.empresaSiteIds.length) or.push({ empresaAsociadaSiteId: { $in: a.empresaSiteIds } });
+        const allAssociatedEmpresaIds = [...new Set([...a.empresaSiteIds, ...a.empresaIds])];
+        if (allAssociatedEmpresaIds.length) or.push({ empresaAsociadaSiteId: { $in: allAssociatedEmpresaIds } });
         if (a.empresaIds.length) or.push({ empresaId: { $in: a.empresaIds } });
         return or.length ? { $or: or } : { _id: { $in: [] } };
     }
