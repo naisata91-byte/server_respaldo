@@ -877,6 +877,85 @@ function emitirCliente(evento, cliente) {
     try { if (global.io) global.io.emit(evento, cliente); } catch (_) {}
 }
 
+// Una entidad marcada como "en ambos lados" existe como dos documentos:
+// `companies` y `sites`. Conservamos los documentos separados porque el site
+// tiene datos operativos propios, pero nombre y logo son la misma identidad.
+// Al editar uno, actualizamos a su par usando el nombre ANTERIOR, antes de que
+// el cambio le haga imposible localizarlo.
+async function sincronizarIdentidadEnAmbosLados(origen, anterior, patch) {
+    const destino = origen === 'company' ? coleccionCRM('sites') : coleccionCRM('companies');
+    const anteriorNormalizado = textoNormalizado(anterior?.nombre);
+    if (!anteriorNormalizado) return null;
+    const par = await documentoPorNombre(destino, anteriorNormalizado);
+    if (!par) return null;
+
+    const identidad = { updatedAt: new Date() };
+    if (patch.nombre !== undefined) {
+        identidad.nombre = patch.nombre;
+        identidad.nombreNormalizado = patch.nombreNormalizado;
+    }
+    if (patch.logo !== undefined) identidad.logo = patch.logo;
+    if (Object.keys(identidad).length === 1) return null;
+
+    const result = await destino.findOneAndUpdate(
+        { _id: par._id },
+        { $set: identidad },
+        { returnDocument: 'after' }
+    );
+    return { tipo: origen === 'company' ? 'site' : 'company', documento: result?.value || result };
+}
+
+function coincidenciaNombreExacto(nombre) {
+    const visible = textoVisible(nombre);
+    if (!visible) return null;
+    return new RegExp(`^\\s*${visible.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i');
+}
+
+async function actualizarReferenciasDeCliente(siteId, nombre, nombreAnterior = '') {
+    const id = String(siteId || '');
+    const nombreAnteriorRegex = coincidenciaNombreExacto(nombreAnterior);
+    if (!id && !nombreAnteriorRegex) return;
+    const referencias = [];
+    if (id) referencias.push({ siteId: id });
+    if (nombreAnteriorRegex) referencias.push({ nombreCliente: nombreAnteriorRegex }, { 'datosActa.razonSocial': nombreAnteriorRegex });
+    const filtroTickets = referencias.length === 1 ? referencias[0] : { $or: referencias };
+    // `datosActa.razonSocial` se almacena para el acta; debe seguir al cliente
+    // cuando su razón social se corrige, igual que la etiqueta del reporte.
+    // Las memorias técnicas ya descargadas son PDFs estáticos: se invalidan
+    // para que la siguiente descarga se regenere con la identidad actual.
+    await coleccionCRM('tickets').updateMany(
+        filtroTickets,
+        {
+            $set: { nombreCliente: nombre, 'datosActa.razonSocial': nombre, updatedAt: new Date() },
+            $unset: { 'memoriaTecnica.pdfArchivoId': '', 'memoriaTecnica.pdfGeneradoEn': '' }
+        }
+    );
+    const referenciasCrm = [];
+    if (id) referenciasCrm.push({ clienteId: id });
+    if (nombreAnteriorRegex) referenciasCrm.push({ clienteNombre: nombreAnteriorRegex });
+    const filtroCrm = referenciasCrm.length === 1 ? referenciasCrm[0] : { $or: referenciasCrm };
+    await Promise.all([
+        CRMCotizacion.updateMany(filtroCrm, { $set: { clienteNombre: nombre } }),
+        CRMProyecto.updateMany(filtroCrm, { $set: { clienteNombre: nombre } }),
+        CRMClientePortal.updateMany({ empresa: nombreAnteriorRegex || nombre }, { $set: { empresa: nombre } })
+    ]);
+}
+
+async function actualizarReferenciasDeEmpresa(companyId, nombre, nombreAnterior = '') {
+    const id = String(companyId || '');
+    const nombreAnteriorRegex = coincidenciaNombreExacto(nombreAnterior);
+    if (!id && !nombreAnteriorRegex) return;
+    const referencias = [];
+    if (id) referencias.push({ empresaId: id }, { empresaAsociadaSiteId: id });
+    if (nombreAnteriorRegex) referencias.push({ empresaAsociadaNombre: nombreAnteriorRegex });
+    // No se usa este texto como fuente de verdad al leer, pero se mantiene
+    // actualizado para los reportes creados antes de esta corrección.
+    await coleccionCRM('tickets').updateMany(
+        { $or: referencias },
+        { $set: { empresaAsociadaNombre: nombre, updatedAt: new Date() } }
+    );
+}
+
 async function asegurarClienteCotizacion(data) {
     const sites = coleccionCRM('sites');
     const nombreEscrito = textoVisible(data.clienteNombre);
@@ -952,7 +1031,7 @@ app.post('/api/companies', upload.single('logo'), async (req, res) => {
         const now = new Date();
         const company = {
             _id: new mongoose.Types.ObjectId(), nombre, nombreNormalizado: normalizado,
-            logo: req.file ? `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}` : null,
+            logo: req.file ? `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}` : (req.body?.logo || null),
             createdAt: now, updatedAt: now,
         };
         await companies.insertOne(company);
@@ -982,8 +1061,14 @@ app.put('/api/companies/:id', upload.single('logo'), async (req, res) => {
         if (req.file) patch.logo = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
         const result = await companies.findOneAndUpdate({ _id: existing._id }, { $set: patch }, { returnDocument: 'after' });
         const updated = result?.value || result;
+        const synchronized = await sincronizarIdentidadEnAmbosLados('company', existing, patch);
+        if (patch.nombre !== undefined) {
+            await actualizarReferenciasDeEmpresa(existing._id, patch.nombre, existing.nombre);
+            if (synchronized?.tipo === 'site') await actualizarReferenciasDeCliente(synchronized.documento._id, patch.nombre, existing.nombre);
+        }
         const publicCompany = documentoPublicoCRM(updated);
         emitirCliente('company_updated', publicCompany);
+        if (synchronized?.tipo === 'site') emitirCliente('site_updated', clientePublico(synchronized.documento));
         res.json(publicCompany);
     } catch (error) {
         console.error('Error updating company:', error);
@@ -1037,7 +1122,7 @@ app.post('/api/sites', upload.single('logo'), async (req, res) => {
             telefonoContacto: textoVisible(req.body?.telefonoContacto),
             correoContacto: textoVisible(req.body?.correoContacto),
             empresaId, companyId: empresaId,
-            logo: req.file ? `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}` : null,
+            logo: req.file ? `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}` : (req.body?.logo || null),
             origen: 'manual', createdAt: now, updatedAt: now,
         };
         await sites.insertOne(site);
@@ -1075,8 +1160,14 @@ app.put('/api/sites/:id', upload.single('logo'), async (req, res) => {
         if (req.file) patch.logo = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
         const result = await sites.findOneAndUpdate({ _id: existing._id }, { $set: patch }, { returnDocument: 'after' });
         const updated = result?.value || result;
+        const synchronized = await sincronizarIdentidadEnAmbosLados('site', existing, patch);
+        if (patch.nombre !== undefined) {
+            await actualizarReferenciasDeCliente(existing._id, patch.nombre, existing.nombre);
+            if (synchronized?.tipo === 'company') await actualizarReferenciasDeEmpresa(synchronized.documento._id, patch.nombre, existing.nombre);
+        }
         const publicSite = clientePublico(updated);
         emitirCliente('site_updated', publicSite);
+        if (synchronized?.tipo === 'company') emitirCliente('company_updated', documentoPublicoCRM(synchronized.documento));
         res.json(publicSite);
     } catch (error) {
         console.error('Error updating site:', error);
@@ -1090,9 +1181,12 @@ app.put('/api/sites/:id/logo', upload.single('logo'), async (req, res) => {
         const sites = coleccionCRM('sites');
         const existing = await documentoPorId(sites, req.params.id);
         if (!existing) return res.status(404).json({ error: 'Cliente no encontrado.' });
-        const result = await sites.findOneAndUpdate({ _id: existing._id }, { $set: { logo: `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`, updatedAt: new Date() } }, { returnDocument: 'after' });
+        const logo = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+        const result = await sites.findOneAndUpdate({ _id: existing._id }, { $set: { logo, updatedAt: new Date() } }, { returnDocument: 'after' });
         const updated = clientePublico(result?.value || result);
+        const synchronized = await sincronizarIdentidadEnAmbosLados('site', existing, { logo });
         emitirCliente('site_updated', updated);
+        if (synchronized?.tipo === 'company') emitirCliente('company_updated', documentoPublicoCRM(synchronized.documento));
         res.json(updated);
     } catch (error) {
         console.error('Error updating site logo:', error);
