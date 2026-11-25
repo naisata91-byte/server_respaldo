@@ -1905,12 +1905,15 @@ app.put('/api/cotizaciones/:id', async (req, res) => {
 
         let anterior = await CRMCotizacion.findById(id);
 
-        // Si la cotización no existe por ese ID (por ejemplo se creó offline con un ID provisional "offline_...")
+        // Solo crear si el ID es provisional de modo offline ("offline_..." / "local_...").
+        // Si es un ID real de MongoDB y ya no existe, fue eliminado en la nube:
+        // jamás recrearlo desde una PC antigua que se reconecta días después.
         if (!anterior) {
-            if (esSyncOffline || String(id).startsWith('offline_') || String(id).startsWith('local_')) {
+            const esIdProvisional = String(id).startsWith('offline_') || String(id).startsWith('local_');
+            if (esIdProvisional) {
                 delete data._id;
                 // Si el folio choca con una existente, asignar uno libre
-                if (data.folio) {
+                if (data.folio && !/^OFF-/i.test(String(data.folio).trim())) {
                     const choca = await CRMCotizacion.findOne({ folio: data.folio });
                     if (choca) {
                         data.folio = await generarFolioAutomatico();
@@ -1924,7 +1927,21 @@ app.put('/api/cotizaciones/:id', async (req, res) => {
                 if (global.io) global.io.emit('cotizacion_creada', newCot);
                 return res.json({ message: 'Cotización offline sincronizada exitosamente', data: newCot, folioReasignado: true, folioNuevo: newCot.folio, idProvisional: id });
             }
-            return res.status(404).json({ error: 'Cotización no encontrada' });
+            return res.status(404).json({ error: 'Cotización no encontrada (posiblemente eliminada en la nube)' });
+        }
+
+        // Proteger la nube contra PCs desconectadas días que envían cambios viejos
+        if (esSyncOffline) {
+            const revCliente = Number(data.revision);
+            const revServidor = valorNumero(anterior.revision);
+            if (Number.isFinite(revCliente) && revCliente > 0 && revServidor > revCliente) {
+                return res.status(409).json({ error: 'La cotización en la nube tiene una revisión más reciente.' });
+            }
+            const tsCliente = Number(data._offlineModified || 0);
+            const tsServidor = new Date(anterior.colaboracionActualizadaEn || anterior.updatedAt || 0).getTime();
+            if (tsCliente > 0 && tsServidor > 0 && tsServidor > tsCliente) {
+                return res.status(409).json({ error: 'La cotización en la nube fue modificada más recientemente.' });
+            }
         }
 
         const clienteResultado = data.esBorrador === true ? null : await asegurarClienteCotizacion(data);
