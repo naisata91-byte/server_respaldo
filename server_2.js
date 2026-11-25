@@ -1656,6 +1656,9 @@ app.post('/api/cotizaciones', async (req, res) => {
     try {
         const data = req.body;
         const actor = actorCotizacion(req);
+        if (req.headers['x-offline-sync'] === 'true' && data?.esBorrador === true) {
+            return res.status(400).json({ error: 'Los borradores no se sincronizan desde modo offline.' });
+        }
         offlineOperationId = String(req.get('x-offline-operation-id') || data?._offlineOperationId || '').trim().slice(0, 200);
 
         // Primero consultar la identidad persistente. La caché HTTP de
@@ -1767,7 +1770,7 @@ app.patch('/api/cotizaciones/:id/campos', async (req, res) => {
             const fechaNueva = normalizarFechaCotizacion(cambios.fechaCreacion);
             if (fechaNueva) cambios.fechaCreacion = fechaNueva; else delete cambios.fechaCreacion;
         }
-        if (typeof cambios.folio === 'string' && ['Asignación Automática', 'Sin folio', 'Personalizado'].includes(cambios.folio.trim())) delete cambios.folio;
+        if (typeof cambios.folio === 'string' && (['Asignación Automática', 'Sin folio', 'Personalizado'].includes(cambios.folio.trim()) || /^OFF-/i.test(cambios.folio.trim()))) delete cambios.folio;
         if (cambios.folio && cambios.folio.trim() !== '' && cambios.folio !== cot.folio) {
             const existe = await CRMCotizacion.findOne({ folio: cambios.folio.trim() });
             if (existe && String(existe._id) !== String(cot._id)) {
@@ -1947,8 +1950,8 @@ app.put('/api/cotizaciones/:id', async (req, res) => {
         data.revision = valorNumero(anterior.revision) + 1;
         data.colaboracionActualizadaEn = new Date();
         
-        // Prevent overwriting the folio with an empty string or default labels which trigger duplicate key E11000
-        if (data.folio === '' || data.folio === 'Asignación Automática' || data.folio === 'Sin folio') {
+        // Prevent overwriting the folio with an empty string, temporary offline folio, or default labels which trigger duplicate key E11000
+        if (data.folio === '' || data.folio === 'Asignación Automática' || data.folio === 'Sin folio' || /^OFF-/i.test(String(data.folio || '').trim())) {
             delete data.folio;
         } else if (data.folio && data.folio !== anterior.folio) {
             // Si el folio que trae colisiona con otra cotización existente diferente
