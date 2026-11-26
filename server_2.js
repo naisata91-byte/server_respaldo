@@ -4373,6 +4373,17 @@ try {
     process.stderr.write('[Inventario] Modulo no cargado: ' + (e && e.message) + '\n');
 }
 
+// Tickets de seguimiento del portal de clientes (modulo aparte: tickets-soporte-routes.js)
+let notificarTicketSoporte = () => {};
+try {
+    app.locals.ticketsSoporte = require('./tickets-soporte-routes')({
+        app, mongoose, authCliente, CRMArchivo, UserRef,
+        notificar: (...args) => notificarTicketSoporte(...args)
+    });
+} catch (e) {
+    process.stderr.write('[Tickets soporte] Modulo no cargado: ' + (e && e.message) + '\n');
+}
+
 // Obtener datos del cliente actual
 app.get('/api/clientes/me', authCliente, (req, res) => {
     res.json({ 
@@ -4386,33 +4397,60 @@ app.get('/api/clientes/me', authCliente, (req, res) => {
 
 // Logout
 // --- FUNCIÓN DE NOTIFICACIÓN SILENCIOSA (De fondo) ---
+// Administradores que reciben las alertas del portal por WhatsApp.
+const obtenerAdminsAviso = () => UserRef.find({
+    telefono: { $exists: true, $ne: null, $ne: '' },
+    $or: [
+        { rol: { $regex: /admin|administrador|master/i } },
+        { correo: { $regex: /jonathan|daniel/i } }
+    ]
+});
+
+const enviarWhatsAppAdmins = async (admins, mensaje) => {
+    for (const admin of admins) {
+        if (admin.telefono) {
+            const cleanPhone = admin.telefono.replace(/\D/g, '');
+            if (cleanPhone.length >= 10) {
+                await sendWhatsAppMessage(admin.telefono, mensaje).catch(()=>{});
+                await new Promise(r => setTimeout(r, 1000));
+            }
+        }
+    }
+};
+
 const notificarAdminsSilencioso = async (cliente, folioAviso, accionStr) => {
     try {
-        const admins = await UserRef.find({ 
-            telefono: { $exists: true, $ne: null, $ne: '' },
-            $or: [
-                { rol: { $regex: /admin|administrador|master/i } },
-                { correo: { $regex: /jonathan|daniel/i } }
-            ]
-        });
-        
+        const admins = await obtenerAdminsAviso();
+
         console.log(`[Notificaciones] Admins encontrados para enviar alerta: ${admins.length}`);
         if (!admins || admins.length === 0) return;
         
         const clienteAviso = cliente.nombre + (cliente.empresa ? ` (${cliente.empresa})` : '');
         const mensaje = `🔔 *ALERTA CRM - PORTAL CLIENTES*\nEl cliente *${clienteAviso}* ha ingresado a su portal y está ${accionStr} la cotización *${folioAviso}*.\n\n💡 _Revisa la plataforma para ver los detalles._`;
         
-        for (const admin of admins) {
-            if (admin.telefono) {
-                const cleanPhone = admin.telefono.replace(/\D/g, '');
-                if (cleanPhone.length >= 10) {
-                    await sendWhatsAppMessage(admin.telefono, mensaje).catch(()=>{});
-                    await new Promise(r => setTimeout(r, 1000));
-                }
-            }
-        }
+        await enviarWhatsAppAdmins(admins, mensaje);
     } catch (err) {
         console.error('Error enviando alerta silenciosa:', err.message);
+    }
+};
+
+// Avisos de tickets de seguimiento: en vivo al CRM (socket.io) y por WhatsApp
+// a los mismos administradores cuando escribe el cliente.
+notificarTicketSoporte = async ({ tipo, ticket, cliente }) => {
+    try {
+        const tipos = { ticket_nuevo: 'nuevo', ticket_mensaje: 'mensaje_cliente', ticket_respuesta: 'mensaje_equipo', ticket_estado: 'estado' };
+        if (global.io) global.io.emit('ticket_soporte', { _id: String(ticket._id), folio: ticket.folio, tipo: tipos[tipo] || tipo, estado: ticket.estado });
+        if (process.env.NODE_ENV === 'test') return;
+        if (tipo !== 'ticket_nuevo' && tipo !== 'ticket_mensaje') return;
+        const admins = await obtenerAdminsAviso();
+        if (!admins || admins.length === 0) return;
+        const ultimo = (ticket.mensajes || [])[ticket.mensajes.length - 1] || {};
+        const quien = ((cliente && cliente.nombre) || ticket.clienteNombre || 'Cliente') + (ticket.empresa ? ` (${ticket.empresa})` : '');
+        const encabezado = tipo === 'ticket_nuevo' ? '🎫 *TICKET NUEVO' : '💬 *RESPUESTA EN TICKET';
+        const mensaje = `${encabezado} ${ticket.folio}* de *${quien}*\n${ticket.asunto}\n${String(ultimo.texto || '').slice(0, 300)}`;
+        await enviarWhatsAppAdmins(admins, mensaje);
+    } catch (err) {
+        console.error('Error enviando aviso de ticket:', err.message);
     }
 };
 // ---------------------------------------------------
@@ -4472,14 +4510,31 @@ app.get('/api/clientes/mis-cotizaciones', authCliente, async (req, res) => {
 
         if (!req.cliente.isAdmin) query = await app.locals.portalCuentas.ajustarQueryCotizaciones(req.cliente, query);
         const cotizaciones = await CRMCotizacion.find({ ...query, esBorrador: { $ne: true } })
-            .select('folio clienteNombre descripcion total estado fechaCreacion')
+            .select('folio clienteNombre descripcion total estado fechaCreacion permisosPortalModificacion contacto creadorCorreo accesosPortal')
             .sort({ fechaCreacion: -1 });
 
-        res.json(cotizaciones);
+        // Se indica en la lista si el cliente puede editar cada una (misma regla que /preview y /modificar).
+        const yo = req.cliente._id.toString();
+        const lista = await Promise.all(cotizaciones.map(async cot => {
+            let puedeModificar = (cot.permisosPortalModificacion || []).includes(yo);
+            if (!puedeModificar && !req.cliente.isAdmin) {
+                try { puedeModificar = !!(await app.locals.portalCuentas.cotizacion(req.cliente, cot, false)).editar; } catch (_) { puedeModificar = false; }
+            }
+            return {
+                _id: cot._id, folio: cot.folio, clienteNombre: cot.clienteNombre, descripcion: cot.descripcion,
+                total: cot.total, estado: cot.estado, fechaCreacion: cot.fechaCreacion, puedeModificar
+            };
+        }));
+        res.json(lista);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
+
+// Campos de la cotización que el cliente del portal nunca debe recibir (costos,
+// accesos de otros clientes, control de sincronización).
+const CAMPOS_COTIZACION_INTERNOS = ['productosSugeridos', 'accesosPortal', 'permisosPortalModificacion', 'offlineOperationId', 'offlineTempId',
+    'revision', 'colaboracionActualizadaEn', 'vendedorId', 'requiereRevision', 'proyectoActivoId', '__v'];
 
 // Ver detalles de una cotización específica (Vista Previa)
 app.get('/api/clientes/cotizaciones/:id/preview', authCliente, async (req, res) => {
@@ -4500,7 +4555,9 @@ app.get('/api/clientes/cotizaciones/:id/preview', authCliente, async (req, res) 
         }
 
         const puedeModificar = !!((cot.permisosPortalModificacion && cot.permisosPortalModificacion.includes(req.cliente._id.toString())) || _pc.editar);
-        res.json({ ...cot.toObject(), puedeModificar });
+        const publica = cot.toObject();
+        CAMPOS_COTIZACION_INTERNOS.forEach(campo => { delete publica[campo]; });
+        res.json({ ...publica, puedeModificar });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -4577,8 +4634,11 @@ app.post('/api/clientes/cotizaciones/:id/modificar', authCliente, async (req, re
             return res.status(403).json({ error: 'No tienes permiso para modificar esta cotización' });
         }
         
-        if (!Array.isArray(partidas)) {
+        if (!Array.isArray(partidas) || partidas.length > 500) {
             return res.status(400).json({ error: 'Formato de partidas inválido' });
+        }
+        if (partidas.some(p => !p || (parseFloat(p.cantidad) || 0) < 0 || (parseFloat(p.precioUnitario) || 0) < 0)) {
+            return res.status(400).json({ error: 'Las cantidades y los precios no pueden ser negativos' });
         }
 
         // El cliente puede ajustar los datos mostrados en el encabezado de su propuesta.
@@ -4627,25 +4687,34 @@ app.post('/api/clientes/cotizaciones/:id/modificar', authCliente, async (req, re
         const iva = subtotal * 0.16;
         const total = subtotal; // Mantenemos consistencia con el CRM: 'total' es el subtotal, el IVA se suma en la vista
         
-        if (original.cotizacionOriginalId) {
-            // Ya es una copia, actualizamos la copia
-            original.partidas = partidasNuevas;
-            original.subtotal = subtotal;
-            original.iva = iva;
-            original.total = total;
-            original.fechaCreacion = fechaActualizada || new Date(); // Fecha elegida por el cliente (o ahora si no se envió)
-            // Actualizar notas si se enviaron
-            if (typeof notas === 'string') original.notas = notas;
-            original.clienteNombre = clienteNombreActualizado;
-            original.contacto = contactoActualizado;
-            await original.save();
-            res.json({ message: 'Cotización modificada y actualizada', id: original._id });
+        // Si el cliente ya tiene su versión de esta original, se actualiza esa misma
+        // (antes se creaba otra copia con el mismo folio "-MOD").
+        const copiaExistente = original.cotizacionOriginalId ? original : await CRMCotizacion.findOne({
+            cotizacionOriginalId: original._id.toString(),
+            esModificadaPorCliente: true,
+            accesosPortal: req.cliente._id.toString()
+        });
+        if (copiaExistente) {
+            copiaExistente.partidas = partidasNuevas;
+            copiaExistente.subtotal = subtotal;
+            copiaExistente.iva = iva;
+            copiaExistente.total = total;
+            copiaExistente.fechaCreacion = fechaActualizada || new Date(); // Fecha elegida por el cliente (o ahora si no se envió)
+            if (typeof notas === 'string') copiaExistente.notas = notas;
+            copiaExistente.clienteNombre = clienteNombreActualizado;
+            copiaExistente.contacto = contactoActualizado;
+            await copiaExistente.save();
+            res.json({ message: 'Cotización modificada y actualizada', id: copiaExistente._id });
         } else {
             // Es la original, creamos una copia
             const nuevaFolio = original.folio ? `${original.folio}-MOD` : `MOD-${Date.now().toString().slice(-6)}`;
             
+            const base = original.toObject();
+            // La copia es una cotización nueva: no hereda la identidad de sincronización
+            // offline (índice único), la revisión ni el proyecto ligado a la original.
+            ['_id', '__v', 'offlineOperationId', 'offlineTempId', 'revision', 'colaboracionActualizadaEn', 'proyectoActivoId'].forEach(c => { delete base[c]; });
             const copia = new CRMCotizacion({
-                ...original.toObject(),
+                ...base,
                 _id: new mongoose.Types.ObjectId().toString(),
                 folio: nuevaFolio,
                 partidas: partidasNuevas,
