@@ -3,6 +3,8 @@ const dns = require('dns');
 dns.setServers(['8.8.8.8', '8.8.4.4', '1.1.1.1']);
 
 require('dotenv').config();
+const zlib = require('zlib');
+const syncGuard = require('./cotizaciones-sync-guard');
 
 // Registro de diagnóstico en memoria
 const waLog = {
@@ -273,6 +275,33 @@ io.on('connection', socket => {
 
 // Middleware
 app.use(cors());
+
+// Compresión gzip de respuestas JSON grandes (listas completas de cotizaciones,
+// proyectos, etc.). Reduce mucho el tiempo de descarga en cada PC. Sólo aplica
+// si el cliente la acepta; las respuestas pequeñas se envían igual que antes.
+app.use((req, res, next) => {
+    if (!/\bgzip\b/i.test(String(req.headers['accept-encoding'] || ''))) return next();
+    const jsonOriginal = res.json.bind(res);
+    res.json = (body) => {
+        let texto;
+        try { texto = JSON.stringify(body); } catch (_) { return jsonOriginal(body); }
+        if (texto === undefined || texto.length < 4096 || res.headersSent || res.getHeader('Content-Encoding')) {
+            return jsonOriginal(body);
+        }
+        zlib.gzip(texto, (err, comprimido) => {
+            if (res.headersSent) return;
+            if (err) return jsonOriginal(body);
+            res.setHeader('Content-Type', 'application/json; charset=utf-8');
+            res.setHeader('Content-Encoding', 'gzip');
+            res.setHeader('Vary', 'Accept-Encoding');
+            res.setHeader('Content-Length', comprimido.length);
+            res.end(comprimido);
+        });
+        return res;
+    };
+    next();
+});
+
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
@@ -297,7 +326,7 @@ app.use((req, res, next) => {
     const cacheKey = `${actor}:${req.method}:${req.originalUrl}:${key}`;
     const previous = idempotencyEntries.get(cacheKey);
     if (previous) {
-        if (previous.pending) return res.status(409).json({ error: 'Esta operación ya está en proceso. Espera la confirmación.' });
+        if (previous.pending) return res.status(409).json({ error: 'Esta operación ya está en proceso. Espera la confirmación.', code: 'operacion_en_proceso' });
         return replayIdempotentResponse(res, previous);
     }
 
@@ -320,6 +349,15 @@ app.use((req, res, next) => {
     res.json = body => { remember(body); return originalJson(body); };
     res.send = body => { remember(body); return originalSend(body); };
     res.on('finish', () => { if (entry.pending) remember(null); });
+    next();
+});
+
+// La cola offline de proyectos, actividades y eventos también debe venir de
+// una versión actual del programa y no tener más de 48 h.
+app.use(['/api/proyectos', '/api/actividades', '/api/eventos'], (req, res, next) => {
+    if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
+    const rechazo = syncGuard.validarClienteOffline(req);
+    if (rechazo) return res.status(rechazo.status).json(rechazo.body);
     next();
 });
 
@@ -477,10 +515,50 @@ const CRMCotizacionSchema = new mongoose.Schema({
     // mismo POST cuando la respuesta se pierde y se reenvía desde la cola
     // offline, aun si el servidor se reinició entre ambos intentos.
     offlineOperationId: { type: String, unique: true, sparse: true },
+    // ID provisional (offline_*) con el que la PC creó la cotización sin
+    // conexión. Si la misma PC (u otra de la red local) vuelve a enviarla, se
+    // reconoce aunque se haya perdido el offlineOperationId.
+    offlineTempId: { type: String, unique: true, sparse: true },
     revision: { type: Number, default: 0 },
     colaboracionActualizadaEn: Date
 });
+// Toda escritura incrementa la revisión (ver cotizaciones-sync-guard.js).
+syncGuard.instalarRevisionAutomatica(CRMCotizacionSchema);
 const CRMCotizacion = mongoose.model('CRMCotizacion', CRMCotizacionSchema);
+
+// Registro de cotizaciones eliminadas. Una PC desconectada que todavía tenga
+// una de ellas en su cola no puede volver a crearla.
+const CRMCotizacionEliminadaSchema = new mongoose.Schema({
+    _id: { type: String, default: () => new mongoose.Types.ObjectId().toString() },
+    cotizacionId: { type: String, index: true },
+    offlineOperationId: { type: String, index: true },
+    offlineTempId: { type: String, index: true },
+    folio: String,
+    eliminadoPor: String,
+    eliminadoEn: { type: Date, default: Date.now }
+});
+const CRMCotizacionEliminada = mongoose.model('CRMCotizacionEliminada', CRMCotizacionEliminadaSchema);
+
+async function registrarCotizacionEliminada(cot, req) {
+    try {
+        await CRMCotizacionEliminada.create({
+            cotizacionId: String(cot._id),
+            offlineOperationId: cot.offlineOperationId || undefined,
+            offlineTempId: cot.offlineTempId || undefined,
+            folio: cot.folio || undefined,
+            eliminadoPor: req ? actorCotizacion(req) : undefined
+        });
+    } catch (e) { console.error('No se pudo registrar la cotización eliminada:', e.message); }
+}
+
+async function buscarCotizacionEliminada({ cotizacionId, offlineOperationId, offlineTempId }) {
+    const or = [];
+    if (cotizacionId && !syncGuard.esIdTemporal(cotizacionId)) or.push({ cotizacionId: String(cotizacionId) });
+    if (offlineOperationId) or.push({ offlineOperationId: String(offlineOperationId) });
+    if (offlineTempId) or.push({ offlineTempId: String(offlineTempId) });
+    if (!or.length) return null;
+    return CRMCotizacionEliminada.findOne({ $or: or }).lean();
+}
 
 // Los clientes offline usan un ID temporal sólo para poder trabajar sin red.
 // La nube es la única autoridad para emitir IDs persistentes: al recibir una
@@ -500,6 +578,20 @@ async function prepararIdParaCrear(Model, data, req) {
         return idProvisional;
     }
     return null;
+}
+
+// Altas offline de proyectos, actividades y eventos: si la misma PC (u otra de
+// la red local) reenvía un registro que la nube ya creó, se devuelve el
+// original en lugar de crear una copia.
+async function altaOfflineYaRegistrada(Model, idProvisional, data, res) {
+    if (!syncGuard.esIdTemporal(idProvisional)) return false;
+    const existente = await Model.findOne({ offlineTempId: String(idProvisional) });
+    if (existente) {
+        res.json({ message: 'Registro ya sincronizado; se reutilizó el original.', data: existente, idProvisional });
+        return true;
+    }
+    data.offlineTempId = String(idProvisional);
+    return false;
 }
 
 // ─── Colaboración de cotizaciones ──────────────────────────────────────────
@@ -673,6 +765,8 @@ const CRMProyectoSchema = new mongoose.Schema({
     // Auditoría: se llena cuando el cierre se forzó saltando los candados de seguridad
     cierreForzado: { por: String, fecha: Date, pendientes: [String] }
 });
+// ID provisional con el que una PC creó el registro sin conexión (evita duplicados al reintentar).
+CRMProyectoSchema.add({ offlineTempId: { type: String, index: true } });
 const CRMProyecto = mongoose.model('CRMProyecto', CRMProyectoSchema);
 
 // Schema para almacenar archivos/imágenes en MongoDB (Base64)
@@ -731,6 +825,8 @@ const CRMActividadSchema = new mongoose.Schema({
     }],
     fechaCreacion: { type: Date, default: Date.now }
 });
+// ID provisional con el que una PC creó el registro sin conexión (evita duplicados al reintentar).
+CRMActividadSchema.add({ offlineTempId: { type: String, index: true } });
 const CRMActividad = mongoose.model('CRMActividad', CRMActividadSchema);
 
 const CRMEventoSchema = new mongoose.Schema({
@@ -745,6 +841,8 @@ const CRMEventoSchema = new mongoose.Schema({
     recordatorioEnviado: { type: Boolean, default: false },
     fechaCreacion: { type: Date, default: Date.now }
 });
+// ID provisional con el que una PC creó el registro sin conexión (evita duplicados al reintentar).
+CRMEventoSchema.add({ offlineTempId: { type: String, index: true } });
 const CRMEvento = mongoose.model('CRMEvento', CRMEventoSchema);
 
 const CRMAjustesSchema = new mongoose.Schema({
@@ -1625,7 +1723,8 @@ app.get('/api/cotizaciones/:id', async (req, res) => {
         const cot = await CRMCotizacion.findById(req.params.id);
         if (!cot) return res.status(404).json({ error: 'No encontrado' });
         // Migración transparente de cotizaciones anteriores al modo colaborativo.
-        if (normalizarLineasCotizacion(cot)) await cot.save();
+        // No cuenta como cambio de contenido: no incrementa la revisión.
+        if (normalizarLineasCotizacion(cot)) { cot.$locals.sinRevision = true; await cot.save(); }
         res.json(cot);
     } catch(err) { res.status(500).json({error: err.message}); }
 });
@@ -1651,22 +1750,99 @@ function normalizarFechaCotizacion(valor) {
     return f;
 }
 
-app.post('/api/cotizaciones', async (req, res) => {
+// Una PC confirmó sin conexión un borrador que sí alcanzó a crearse en la nube
+// (la respuesta se perdió). En lugar de devolver el borrador vacío —que luego
+// se ocultaba y se perdía— se confirma con los datos que trae la PC.
+async function confirmarBorradorDesdeOffline(borrador, data, req, res) {
+    const actor = actorCotizacion(req);
+    const permitidos = ['clienteId', 'clienteNombre', 'vendedorId', 'descripcion', 'lugarEjecucion', 'contacto', 'categoria',
+        'condiciones', 'notas', 'estado', 'fechaSeguimiento', 'requiereRevision', 'creadorNombre', 'creadorCorreo', 'creadorTelefono', 'archivos'];
+    permitidos.forEach(campo => {
+        if (!Object.prototype.hasOwnProperty.call(data, campo) || data[campo] === undefined) return;
+        if (campo === 'categoria' && !data[campo]) return;
+        borrador[campo] = data[campo];
+    });
+    ['partidas', 'productosSugeridos'].forEach(campo => {
+        if (!Array.isArray(data[campo]) || !data[campo].length) return;
+        const ids = new Set();
+        borrador[campo] = data[campo].map(linea => {
+            const p = payloadLinea(campo, linea, actor);
+            if (ids.has(p.lineaId)) p.lineaId = nuevaLineaId();
+            ids.add(p.lineaId);
+            return p;
+        });
+    });
+    const fecha = normalizarFechaCotizacion(data.fechaCreacion);
+    if (fecha) borrador.fechaCreacion = fecha;
+    const candidato = { ...borrador.toObject() };
+    const clienteResultado = await asegurarClienteCotizacion(candidato);
+    borrador.clienteId = candidato.clienteId || '';
+    borrador.clienteNombre = candidato.clienteNombre || '';
+    borrador.esBorrador = false;
+    if (!borrador.folio) borrador.folio = await generarFolioAutomatico();
+    recalcularCotizacion(borrador);
+    for (let intento = 0; intento < 20; intento++) {
+        try { await borrador.save(); break; }
+        catch (error) {
+            if (!esDuplicadoDeFolio(error) || intento === 19) throw error;
+            borrador.folio = await generarFolioAutomatico();
+        }
+    }
+    try { if (global.io) global.io.emit('cotizacion_creada', borrador); } catch (_) {}
+    return res.json({
+        message: `Cotización confirmada desde modo offline (folio ${borrador.folio})`,
+        data: borrador,
+        cliente: clienteResultado?.cliente || null,
+        clienteCreado: Boolean(clienteResultado?.creado),
+        folioReasignado: true,
+        folioAnterior: data.folio,
+        folioNuevo: borrador.folio
+    });
+}
+
+app.post('/api/cotizaciones', (req, res) => crearCotizacionHandler(req, res));
+
+async function crearCotizacionHandler(req, res) {
     let offlineOperationId = '';
+    let offlineTempId = '';
     try {
-        const data = req.body;
+        const data = req.body || {};
         const actor = actorCotizacion(req);
-        if (req.headers['x-offline-sync'] === 'true' && data?.esBorrador === true) {
+        const esOffline = syncGuard.esPeticionOffline(req);
+        if (syncGuard.esPeticionColaOffline(req) && data?.esBorrador === true) {
             return res.status(400).json({ error: 'Los borradores no se sincronizan desde modo offline.' });
         }
+        // Versión mínima del programa y antigüedad máxima del cambio offline.
+        const rechazo = syncGuard.validarClienteOffline(req);
+        if (rechazo) return res.status(rechazo.status).json(rechazo.body);
+
         offlineOperationId = String(req.get('x-offline-operation-id') || data?._offlineOperationId || '').trim().slice(0, 200);
+        const idRecibido = String(data._id || data.id || '');
+        if (syncGuard.esIdTemporal(idRecibido)) offlineTempId = idRecibido.slice(0, 200);
+
+        // Una cotización que ya se eliminó en la nube no se vuelve a crear.
+        if (offlineOperationId || offlineTempId) {
+            const eliminada = await buscarCotizacionEliminada({ offlineOperationId, offlineTempId });
+            if (eliminada) {
+                return res.status(410).json({
+                    error: `Esta cotización${eliminada.folio ? ` (${eliminada.folio})` : ''} fue eliminada en la nube; no se volverá a crear.`,
+                    code: 'cotizacion_eliminada'
+                });
+            }
+        }
 
         // Primero consultar la identidad persistente. La caché HTTP de
         // idempotencia protege el caso inmediato; este respaldo cubre una
         // reconexión tardía o un reinicio del servidor.
-        if (offlineOperationId) {
-            const existente = await CRMCotizacion.findOne({ offlineOperationId });
+        const identidades = [];
+        if (offlineOperationId) identidades.push({ offlineOperationId });
+        if (offlineTempId) identidades.push({ offlineTempId });
+        if (identidades.length) {
+            const existente = await CRMCotizacion.findOne({ $or: identidades });
             if (existente) {
+                if (existente.esBorrador === true && data.esBorrador !== true) {
+                    return confirmarBorradorDesdeOffline(existente, data, req, res);
+                }
                 return res.json({
                     message: 'Cotización ya registrada; se reutilizó la operación original.',
                     data: existente,
@@ -1675,7 +1851,12 @@ app.post('/api/cotizaciones', async (req, res) => {
                     folioNuevo: existente.folio
                 });
             }
-            data.offlineOperationId = offlineOperationId;
+            if (offlineOperationId) data.offlineOperationId = offlineOperationId;
+            if (offlineTempId) data.offlineTempId = offlineTempId;
+        }
+        if (esOffline) {
+            // Campos que una alta offline no puede traer: los asigna el servidor.
+            ['revision', 'colaboracionActualizadaEn', 'proyectoActivoId', 'accesosPortal', 'permisosPortalModificacion'].forEach(c => delete data[c]);
         }
 
         // 1. El servidor reemplaza cualquier ID creado offline y cualquier
@@ -1708,8 +1889,14 @@ app.post('/api/cotizaciones', async (req, res) => {
 
         if (data.esBorrador === true) {
             delete data.folio;
+        } else if (esOffline && syncGuard.folioOfflineDebeRegenerarse(data.folio)) {
+            // El folio se calculó sin conexión con una lista vieja (C123 u OFF-*):
+            // la nube asigna el siguiente folio real.
+            folioOriginal = data.folio;
+            data.folio = await generarFolioAutomatico();
+            folioReasignado = Boolean(String(folioOriginal || '').trim());
         } else {
-            const folioManual = data.folio && data.folio.trim() !== '' && data.folio !== 'Sin folio' && data.folio !== 'Asignación Automática';
+            const folioManual = typeof data.folio === 'string' && data.folio.trim() !== '' && data.folio !== 'Sin folio' && data.folio !== 'Asignación Automática';
             if (folioManual) {
                 const existe = await CRMCotizacion.findOne({ folio: data.folio.trim() });
                 if (existe) {
@@ -1747,13 +1934,16 @@ app.post('/api/cotizaciones', async (req, res) => {
         // Dos reintentos simultáneos de la misma operación pueden ganar la
         // consulta anterior a la vez. El índice único decide y devolvemos el
         // documento ya creado en lugar de reportar un falso error o duplicar.
-        if (offlineOperationId && err?.code === 11000 && /offlineOperationId/i.test(String(err?.message || ''))) {
-            const existente = await CRMCotizacion.findOne({ offlineOperationId });
+        if ((offlineOperationId || offlineTempId) && err?.code === 11000 && /offlineOperationId|offlineTempId/i.test(String(err?.message || ''))) {
+            const or = [];
+            if (offlineOperationId) or.push({ offlineOperationId });
+            if (offlineTempId) or.push({ offlineTempId });
+            const existente = await CRMCotizacion.findOne({ $or: or });
             if (existente) return res.json({ message: 'Cotización ya registrada.', data: existente, folioNuevo: existente.folio });
         }
-        res.status(500).json({error: err.message});
+        if (!res.headersSent) res.status(500).json({error: err.message});
     }
-});
+}
 
 app.patch('/api/cotizaciones/:id/campos', async (req, res) => {
     try {
@@ -1900,48 +2090,49 @@ app.post('/api/cotizaciones/:id/descartar-borrador', async (req, res) => {
 app.put('/api/cotizaciones/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const data = req.body;
-        const esSyncOffline = req.headers['x-offline-sync'] === 'true' || Boolean(data._provieneDeOffline || data._offlineModified);
+        const data = req.body || {};
+        const esSyncOffline = syncGuard.esPeticionOffline(req);
+
+        // Un ID provisional ("offline_..." / "local_...") nunca existe en la
+        // nube: se trata como alta, con la misma protección contra duplicados
+        // (offlineOperationId / offlineTempId) y contra cotizaciones eliminadas.
+        if (syncGuard.esIdTemporal(id)) {
+            data._id = id;
+            return crearCotizacionHandler(req, res);
+        }
+
+        const rechazo = syncGuard.validarClienteOffline(req);
+        if (rechazo) return res.status(rechazo.status).json(rechazo.body);
 
         let anterior = await CRMCotizacion.findById(id);
 
-        // Solo crear si el ID es provisional de modo offline ("offline_..." / "local_...").
-        // Si es un ID real de MongoDB y ya no existe, fue eliminado en la nube:
-        // jamás recrearlo desde una PC antigua que se reconecta días después.
+        // Si es un ID real y ya no existe, fue eliminado en la nube: jamás
+        // recrearlo desde una PC antigua que se reconecta días después.
         if (!anterior) {
-            const esIdProvisional = String(id).startsWith('offline_') || String(id).startsWith('local_');
-            if (esIdProvisional) {
-                delete data._id;
-                // Si el folio choca con una existente, asignar uno libre
-                if (data.folio && !/^OFF-/i.test(String(data.folio).trim())) {
-                    const choca = await CRMCotizacion.findOne({ folio: data.folio });
-                    if (choca) {
-                        data.folio = await generarFolioAutomatico();
-                    }
-                } else {
-                    data.folio = await generarFolioAutomatico();
-                }
-                const newCot = new CRMCotizacion({ ...data, revision: 1, colaboracionActualizadaEn: new Date() });
-                recalcularCotizacion(newCot);
-                await newCot.save();
-                if (global.io) global.io.emit('cotizacion_creada', newCot);
-                return res.json({ message: 'Cotización offline sincronizada exitosamente', data: newCot, folioReasignado: true, folioNuevo: newCot.folio, idProvisional: id });
-            }
             return res.status(404).json({ error: 'Cotización no encontrada (posiblemente eliminada en la nube)' });
         }
 
-        // Proteger la nube contra PCs desconectadas días que envían cambios viejos
+        // Proteger la nube contra PCs desconectadas que envían cambios viejos.
+        // La PC debe haber editado exactamente sobre la revisión actual; como
+        // cualquier escritura incrementa la revisión, esto detecta cambios de
+        // estado, folio, proyecto, archivos, portal, etc. hechos por otros.
         if (esSyncOffline) {
-            const revCliente = Number(data.revision);
-            const revServidor = valorNumero(anterior.revision);
-            if (Number.isFinite(revCliente) && revCliente > 0 && revServidor > revCliente) {
-                return res.status(409).json({ error: 'La cotización en la nube tiene una revisión más reciente.' });
-            }
-            const tsCliente = Number(data._offlineModified || 0);
-            const tsServidor = new Date(anterior.colaboracionActualizadaEn || anterior.updatedAt || 0).getTime();
-            if (tsCliente > 0 && tsServidor > 0 && tsServidor > tsCliente) {
-                return res.status(409).json({ error: 'La cotización en la nube fue modificada más recientemente.' });
-            }
+            const revCliente = req.get('x-base-revision') !== undefined && req.get('x-base-revision') !== ''
+                ? req.get('x-base-revision')
+                : data.revision;
+            const conflicto = syncGuard.conflictoDeRevision(anterior, revCliente);
+            if (conflicto) return res.status(conflicto.status).json(conflicto.body);
+            // El folio, el proyecto ligado y los accesos del portal sólo los
+            // administra la nube.
+            syncGuard.quitarCamposProtegidos(data);
+        }
+
+        // Borrador confirmado (por ejemplo, sin conexión): recibe su folio real
+        // y se anuncia como cotización nueva.
+        const confirmaBorrador = anterior.esBorrador === true && data.esBorrador === false;
+        const folioRecibido = typeof data.folio === 'string' ? data.folio.trim() : '';
+        if (confirmaBorrador && !anterior.folio && (!folioRecibido || ['Asignación Automática', 'Sin folio'].includes(folioRecibido) || /^OFF-/i.test(folioRecibido))) {
+            data.folio = await generarFolioAutomatico();
         }
 
         const clienteResultado = data.esBorrador === true ? null : await asegurarClienteCotizacion(data);
@@ -2036,8 +2227,20 @@ app.post('/api/cotizaciones/:id/cancelar-venta', async (req, res) => {
 app.delete('/api/cotizaciones/:id', async (req, res) => {
     try {
         const { id } = req.params;
+        const rechazo = syncGuard.validarClienteOffline(req);
+        if (rechazo) return res.status(rechazo.status).json(rechazo.body);
         const cot = await CRMCotizacion.findById(id);
         if (!cot) return res.status(404).json({ error: 'Cotización no encontrada' });
+
+        // Un borrado hecho sin conexión sólo se aplica si nadie cambió la
+        // cotización desde entonces; si no, se guarda para revisión.
+        if (syncGuard.esPeticionColaOffline(req)) {
+            const conflicto = syncGuard.conflictoDeRevision(cot, req.get('x-base-revision'));
+            if (conflicto) {
+                conflicto.body.error = 'La cotización cambió en la nube después de que esta PC la eliminó sin conexión. No se eliminó; quedó para revisión.';
+                return res.status(conflicto.status).json(conflicto.body);
+            }
+        }
 
         // Verificar que la cotización no esté ligada a un proyecto operativo activo
         if (cot.proyectoActivoId) {
@@ -2057,6 +2260,7 @@ app.delete('/api/cotizaciones/:id', async (req, res) => {
         }
 
         await CRMCotizacion.findByIdAndDelete(id);
+        if (!cot.esBorrador) await registrarCotizacionEliminada(cot, req);
         res.json({ message: `Cotización ${cot.folio || id} eliminada correctamente.` });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -2150,6 +2354,7 @@ app.post('/api/proyectos', async (req, res) => {
     try {
         const data = req.body;
         const idProvisional = await prepararIdParaCrear(CRMProyecto, data, req);
+        if (await altaOfflineYaRegistrada(CRMProyecto, idProvisional, data, res)) return;
 
         const count = await CRMProyecto.countDocuments();
         let folioFinal = `P${count + 1}`;
@@ -2942,6 +3147,7 @@ app.post('/api/actividades', async (req, res) => {
     try {
         const data = req.body;
         const idProvisional = await prepararIdParaCrear(CRMActividad, data, req);
+        if (await altaOfflineYaRegistrada(CRMActividad, idProvisional, data, res)) return;
 
         // Ajuste de zona horaria para evitar desfase de 1 día (forzar mediodía UTC)
         if (data.fechaVencimiento && typeof data.fechaVencimiento === 'string' && data.fechaVencimiento.length === 10) {
@@ -3438,6 +3644,7 @@ app.post('/api/eventos', async (req, res) => {
     try {
         const data = req.body;
         const idProvisional = await prepararIdParaCrear(CRMEvento, data, req);
+        if (await altaOfflineYaRegistrada(CRMEvento, idProvisional, data, res)) return;
         const ev = new CRMEvento(data);
         await ev.save();
         res.json({ message: 'Evento creado', data: ev, idProvisional });
