@@ -500,7 +500,10 @@ module.exports = function ({ app, mongoose, authCliente, CRMArchivo, CRMInventar
     }
 
     async function nombresDeEmpresas(lista) {
-        const ids = [...new Set((lista || []).map(ticket => String(ticket.empresaId || '')).filter(Boolean))];
+        // Los reportes anteriores pueden tener una copia obsoleta de
+        // empresaAsociadaNombre. Siempre se resuelve primero la empresa actual
+        // por su id estable, incluyendo la empresa ejecutora del entregable.
+        const ids = [...new Set((lista || []).flatMap(ticket => [ticket.empresaAsociadaSiteId, ticket.empresaId]).map(id => String(id || '')).filter(Boolean))];
         if (!ids.length) return new Map();
         const empresas = await db().collection('companies').find(
             { $or: ids.flatMap(id => idFilter(id).$or) },
@@ -617,7 +620,7 @@ module.exports = function ({ app, mongoose, authCliente, CRMArchivo, CRMInventar
                 createdAt: t.createdAt || null,
                 fechaFirma: t.fechaFirma || null,
                 nombreCliente: t.nombreCliente || '',
-                empresaNombre: t.empresaAsociadaNombre || empresas.get(String(t.empresaId || '')) || '',
+                empresaNombre: empresas.get(String(t.empresaAsociadaSiteId || '')) || empresas.get(String(t.empresaId || '')) || t.empresaAsociadaNombre || '',
                 firmado: typeof t.firmaCliente === 'string' && t.firmaCliente.length > 0,
                 nFotos: typeof t.nFotos === 'number' ? t.nFotos : (Array.isArray(t.fotos) ? t.fotos.length : 0)
             })));
@@ -642,7 +645,7 @@ module.exports = function ({ app, mongoose, authCliente, CRMArchivo, CRMInventar
                     folio: ticket.folio || '',
                     titulo: ticket.titulo || ticket.nombreTrabajo || '',
                     nombreCliente: ticket.nombreCliente || '',
-                    empresaNombre: ticket.empresaAsociadaNombre || empresas.get(String(ticket.empresaId || '')) || '',
+                    empresaNombre: empresas.get(String(ticket.empresaAsociadaSiteId || '')) || empresas.get(String(ticket.empresaId || '')) || ticket.empresaAsociadaNombre || '',
                     createdAt: ticket.createdAt || null,
                     generadaEn: memoria.generadaEn,
                     resumen: memoria.resumen,
@@ -667,7 +670,7 @@ module.exports = function ({ app, mongoose, authCliente, CRMArchivo, CRMInventar
             const empresas = await nombresDeEmpresas([ticket]);
             res.json({
                 id: String(ticket._id), folio: ticket.folio || '', titulo: ticket.titulo || ticket.nombreTrabajo || '',
-                nombreCliente: ticket.nombreCliente || '', empresaNombre: ticket.empresaAsociadaNombre || empresas.get(String(ticket.empresaId || '')) || '', createdAt: ticket.createdAt || null,
+                nombreCliente: ticket.nombreCliente || '', empresaNombre: empresas.get(String(ticket.empresaAsociadaSiteId || '')) || empresas.get(String(ticket.empresaId || '')) || ticket.empresaAsociadaNombre || '', createdAt: ticket.createdAt || null,
                 pdfDisponible: Boolean(ticket.memoriaTecnica.pdfArchivoId), memoria
             });
         } catch (e) { falla(res, e); }
@@ -730,11 +733,59 @@ module.exports = function ({ app, mongoose, authCliente, CRMArchivo, CRMInventar
             const empresas = await nombresDeEmpresas([t]);
             res.json({
                 id: String(t._id), folio: t.folio || '', titulo: t.titulo || t.nombreTrabajo || '', descripcion: t.descripcion || '', estado: t.estado || '',
-                createdAt: t.createdAt, fechaFirma: t.fechaFirma || null, nombreCliente: t.nombreCliente || '', empresaNombre: t.empresaAsociadaNombre || empresas.get(String(t.empresaId || '')) || '', nombreTecnico: t.nombreTecnico || '',
+                createdAt: t.createdAt, fechaFirma: t.fechaFirma || null, nombreCliente: t.nombreCliente || '', empresaNombre: empresas.get(String(t.empresaAsociadaSiteId || '')) || empresas.get(String(t.empresaId || '')) || t.empresaAsociadaNombre || '', nombreTecnico: t.nombreTecnico || '',
                 firmado: typeof t.firmaCliente === 'string' && t.firmaCliente.length > 0, nombreFirmaCliente: t.nombreFirmaCliente || '',
                 nFotos: typeof t.nFotos === 'number' ? t.nFotos : 0, datosActa,
                 fotosInfo: Array.isArray(acta.fotosInfo) ? acta.fotosInfo.map(f => ({ descripcion: String(f && f.descripcion || ''), fecha: String(f && f.fecha || ''), ubicacion: String(f && f.ubicacion || '') })) : [],
                 puntos
+            });
+        } catch (e) { falla(res, e); }
+    });
+
+    /* Datos completos para que el portal genere el PDF del acta con el mismo
+       diseño que entregables.html (entregable-pdf.js). Mismo alcance que el detalle.
+       Sólo campos que el acta imprime; nada interno. */
+    const ACTA_CAMPOS_PDF = ['fechaEntrega', 'lugarEntrega', 'razonSocial', 'rfc', 'domicilio', 'contacto', 'correo', 'telefono', 'ubicacionProyecto',
+        'responsable', 'fechaInicio', 'fechaTermino', 'observaciones', 'recepcion', 'cargoEntrega', 'nombreRecibe', 'cargoRecibe'];
+    const SITE_CAMPOS_PDF = ['id', 'nombre', 'logo', 'ubicacion', 'rfc', 'domicilio', 'contacto', 'correoContacto', 'telefonoContacto', 'empresaId'];
+    const textoOVacio = v => (typeof v === 'string' ? v : (v == null ? '' : String(v)));
+    const imagenPublica = src => typeof src === 'string' && (/^data:image\/(png|jpe?g|webp|gif);base64,/.test(src) || /^https?:\/\//.test(src) || src.startsWith('/api/archivos/'));
+
+    app.get('/api/clientes/entregables/:id/pdf-datos', authCliente, async (req, res) => {
+        try {
+            const a = await alcance(req);
+            const t = await tickets().findOne({ $and: [idFilter(req.params.id), filtroAlcance(a)] });
+            if (!t) throw httpErr(404, 'Entregable no encontrado');
+
+            let acta = t.datosActa;
+            if (typeof acta === 'string') { try { acta = JSON.parse(acta); } catch (_) { acta = {}; } }
+            acta = acta && typeof acta === 'object' ? acta : {};
+            const datosActa = {};
+            ACTA_CAMPOS_PDF.forEach(k => { if (acta[k] != null && acta[k] !== '') datosActa[k] = textoOVacio(acta[k]); });
+            datosActa.fotosInfo = Array.isArray(acta.fotosInfo) ? acta.fotosInfo.map(f => ({ descripcion: textoOVacio(f && f.descripcion), fecha: textoOVacio(f && f.fecha), ubicacion: textoOVacio(f && f.ubicacion) })) : [];
+
+            const siteId = String(t.siteId || '');
+            const siteDoc = siteId ? await db().collection('sites').findOne(idFilter(siteId)) : null;
+            const site = {};
+            if (siteDoc) SITE_CAMPOS_PDF.forEach(k => { if (siteDoc[k] != null) site[k] = textoOVacio(siteDoc[k]); });
+            if (siteDoc && !site.id) site.id = String(siteDoc._id);
+
+            const empresaId = String(t.empresaId || (siteDoc && (siteDoc.empresaId || siteDoc.companyId)) || '');
+            const empresaDoc = empresaId ? await db().collection('companies').findOne(idFilter(empresaId), { projection: { id: 1, nombre: 1, logo: 1 } }) : null;
+            const company = empresaDoc ? { id: textoOVacio(empresaDoc.id || empresaDoc._id), nombre: textoOVacio(empresaDoc.nombre), logo: textoOVacio(empresaDoc.logo) } : null;
+
+            res.json({
+                ticket: {
+                    id: String(t._id), folio: textoOVacio(t.folio), cotizacionId: textoOVacio(t.cotizacionId), titulo: textoOVacio(t.titulo), nombreTrabajo: textoOVacio(t.nombreTrabajo),
+                    descripcion: textoOVacio(t.descripcion), ordenCompra: textoOVacio(t.ordenCompra), empresaId: textoOVacio(t.empresaId), siteId,
+                    fotos: (Array.isArray(t.fotos) ? t.fotos : []).filter(imagenPublica),
+                    nombreTecnico: textoOVacio(t.nombreTecnico), firmaTecnico: imagenPublica(t.firmaTecnico) ? t.firmaTecnico : '',
+                    firmaCliente: imagenPublica(t.firmaCliente) ? t.firmaCliente : '', nombreFirmaCliente: textoOVacio(t.nombreFirmaCliente),
+                    puestoFirmaCliente: textoOVacio(t.puestoFirmaCliente), fechaFirma: t.fechaFirma || null, createdAt: t.createdAt || null,
+                    datosActa
+                },
+                site,
+                company
             });
         } catch (e) { falla(res, e); }
     });
